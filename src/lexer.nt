@@ -1,0 +1,449 @@
+// C lexer — tokenizes one translation unit into tokens with byte offsets,
+// plus a tiny shared substring reader for re-scans and macro splicing.
+use strings
+use arrays
+use fmt
+
+class Token {
+    var string kind
+    var string text
+    var int ival
+    var float fval
+    var int line
+    var bool space
+    var string file
+
+    fun init(string kind, string text, int ival, float fval, int line) {
+        this.kind = kind
+        this.text = text
+        this.ival = ival
+        this.fval = fval
+        this.line = line
+        this.space = false
+        this.file = ""
+    }
+}
+
+// Token kind names: "id" identifier/keyword, "num" integer, "flo" float,
+// "str" string literal, "chr" char constant, "pn" punctuator, "eo" end.
+fun tok(string kind, string text, int ival, float fval, int line) -> Token {
+    var t = Token(kind, text, ival, fval, line)
+    t.space = false
+    return t
+}
+
+class Lexer {
+    var string src
+    var int pos
+    var int line
+    var int len
+
+    fun init(string s) {
+        this.len = strings.length(s)
+        this.src = s
+        this.pos = 0
+        this.line = 1
+    }
+
+    fun code() -> int {
+        if (this.pos >= this.len) {
+            return 0
+        }
+        return strings.char_code(this.src, this.pos)
+    }
+
+    fun at(int off) -> int {
+        var p = this.pos + off
+        if (p >= this.len) {
+            return 0
+        }
+        return strings.char_code(this.src, p)
+    }
+
+    fun bump() {
+        if (strings.char_code(this.src, this.pos) == 10) {
+            this.line = this.line + 1
+        }
+        this.pos = this.pos + 1
+    }
+}
+
+fun lexError(view Lexer L, string msg) -> Token {
+    throw "nanoc: line " + L.line + ": " + msg
+}
+
+fun digitVal(int c) -> int {
+    if (c >= 48 && c <= 57) { return c - 48 }
+    if (c >= 97 && c <= 102) { return c - 97 + 10 }
+    if (c >= 65 && c <= 70) { return c - 65 + 10 }
+    return -1
+}
+
+fun isDigit(int c) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fun isHex(int c) -> bool {
+    return isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+fun isIdentStart(int c) -> bool {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+}
+
+fun isIdentPart(int c) -> bool {
+    return isIdentStart(c) || isDigit(c)
+}
+
+fun isSpace(int c) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+// Octal escapes and \x escapes inside a string body are copied through
+// unchanged by the code generator (it re-separates the body into the LLVM
+// c"..." bytes form where they need no further processing).
+fun readStringBody(view Lexer L) -> Token {
+    var start = L.pos
+    L.bump()
+    while (L.pos < L.len) {
+        var c = L.code()
+        if (c == 34) {
+            L.bump()
+            return tok("str", strings.substring(L.src, start + 1, L.pos - 1), 0, 0.0, L.line)
+        }
+        if (c == 10) {
+            return lexError(L, "string not terminated")
+        }
+        if (c == 92) {
+            L.bump()
+            L.bump()
+        } else {
+            L.bump()
+        }
+    }
+    return lexError(L, "string not terminated")
+}
+
+fun readCharBody(view Lexer L) -> Token {
+    var start = L.pos
+    L.bump()
+    var c = L.code()
+    var echar = 0
+    if (c == 92) {
+        L.bump()
+        var e = L.code()
+        echar = escaped(e)
+        if (echar == -1) {
+            return lexError(L, "unknown escape \\" + strings.from_char_code(e))
+        }
+        L.bump()
+    } else if (c == 0) {
+        return lexError(L, "empty character literal")
+    } else {
+        echar = c
+        L.bump()
+    }
+    if (L.code() != 39) {
+        return lexError(L, "character constant not terminated")
+    }
+    L.bump()
+    // Keep source spelling for -E and macro stringization; ival is the
+    // decoded value used by #if expressions.
+    var body = strings.substring(L.src, start + 1, L.pos - 1)
+    return tok("chr", body, echar, 0.0, L.line)
+}
+
+fun parseFloatValue(view string spelling) -> float {
+    var value = copy(spelling)
+    var n = strings.length(value)
+    if (n > 0) {
+        var last = strings.substring(copy(value), n - 1, n)
+        if (last == "f" || last == "F" || last == "l" || last == "L") {
+            value = strings.substring(copy(value), 0, n - 1)
+        }
+    }
+    return fmt.to_float(copy(value))
+}
+
+// number: decimal, hex, octal, float, with suffixes L l U u F f e+
+fun readNumber(view Lexer L) -> Token {
+    var rawStart = L.pos
+    var start = L.pos
+    var isFl = false
+    var base = 10
+    if (L.code() == 48) {
+        var nx = L.at(1)
+        if (nx == 120 || nx == 88) {
+            base = 16
+            L.bump()
+            L.bump()
+            start = L.pos
+            while (isHex(L.code())) { L.bump() }
+        } else if (nx == 98 || nx == 66) {
+            base = 2
+            L.bump()
+            L.bump()
+            start = L.pos
+            while (L.code() == 48 || L.code() == 49) { L.bump() }
+        } else {
+            base = 8
+            L.bump()
+            while (isDigit(L.code())) { L.bump() }
+        }
+        var cx = L.code()
+        if (cx == 46 && base == 8) {
+            isFl = true
+            L.bump()
+            while (isDigit(L.code())) { L.bump() }
+        }
+    } else {
+        while (isDigit(L.code())) { L.bump() }
+        if (L.code() == 46) {
+            isFl = true
+            L.bump()
+            while (isDigit(L.code())) { L.bump() }
+        }
+        if (L.code() == 101 || L.code() == 69) {
+            isFl = true
+            L.bump()
+            if (L.code() == 43 || L.code() == 45) { L.bump() }
+            while (isDigit(L.code())) { L.bump() }
+        }
+    }
+    if (L.code() != 46) {
+        if (isFl) {
+            if (base == 10 && (L.code() == 102 || L.code() == 70)) { L.bump() }
+            var fs = strings.substring(L.src, rawStart, L.pos)
+            // ntsc 0.1.0 moves strings passed to calls even when the callee
+            // only reads them.  Keep the source spelling for the token and
+            // diagnostics; the conversion gets an owned copy.
+            var fv = parseFloatValue(fs)
+            if (fv != fv) {
+                return lexError(L, "bad float " + fs)
+            }
+            return tok("flo", fs, 0, fv, L.line)
+        }
+        if (base == 10) {
+            if (L.code() == 102 || L.code() == 70) {
+                isFl = true
+                L.bump()
+            }
+            if (L.code() == 108 || L.code() == 76) {
+                L.bump()
+                if (L.code() == 108 || L.code() == 76) { L.bump() }
+            }
+        }
+        if (base == 10 && isFl) {
+            var fs2 = strings.substring(L.src, rawStart, L.pos)
+            var fv2 = parseFloatValue(fs2)
+            if (fv2 != fv2) {
+                return lexError(L, "bad float " + fs2)
+            }
+            return tok("flo", fs2, 0, fv2, L.line)
+        }
+        while (L.code() == 117 || L.code() == 85 || L.code() == 108 || L.code() == 76) {
+            L.bump()
+        }
+        var ds = strings.substring(L.src, start, L.pos)
+        var dn = strings.length(ds)
+        while (dn > 0) {
+            var lastDigit = strings.substring(copy(ds), dn - 1, dn)
+            if (lastDigit == "u" || lastDigit == "U" || lastDigit == "l" || lastDigit == "L") {
+                dn = dn - 1
+            } else {
+                break
+            }
+        }
+        if (dn < strings.length(ds)) { ds = strings.substring(copy(ds), 0, dn) }
+        var v = parseIntStr(copy(ds), base)
+        if (v == -1) {
+            return lexError(L, "bad integer " + ds)
+        }
+        return tok("num", strings.substring(L.src, rawStart, L.pos), v, 0.0, L.line)
+    }
+    // Hex float "0x1.8p3" — not supported: reject clearly.
+    return lexError(L, "bad number " + strings.substring(L.src, start, L.pos))
+}
+
+// Parses base-2/8/10/16 digits into a value; -1 on a bad digit.
+fun parseIntStr(string s, int base) -> int {
+    if (base == 10) {
+        if (fmt.is_int(copy(s)) == false) {
+            return -1
+        }
+        return fmt.to_int(copy(s))
+    }
+    var v = 0
+    var i = 0
+    var n = strings.length(s)
+    while (i < n) {
+        var d = digitVal(strings.char_code(s, i))
+        if (d < 0 || d >= base) {
+            return -1
+        }
+        v = v * base + d
+        i = i + 1
+    }
+    return v
+}
+
+fun escaped(int e) -> int {
+    if (e == 110) { return 10 }
+    if (e == 116) { return 9 }
+    if (e == 114) { return 13 }
+    if (e == 48) { return 0 }
+    if (e == 92) { return 92 }
+    if (e == 39) { return 39 }
+    if (e == 34) { return 34 }
+    if (e == 97) { return 7 }
+    if (e == 98) { return 8 }
+    if (e == 102) { return 12 }
+    if (e == 118) { return 11 }
+    return -1
+}
+
+// Main entry: tokenize a whole C translation unit.
+// t.space records whether whitespace or a comment preceded the token, which
+// the preprocessor needs to tell "#define F(x)" from "#define F (x)".
+fun lex(string src, view mut array[Token] out) {
+    var L = Lexer(src)
+    var sp = false
+    while (L.pos < L.len) {
+        var c = L.code()
+        if (c == 92 && L.at(1) == 10) {
+            // C translation phase 2 removes escaped newlines before
+            // directives and macro bodies are split into logical lines.
+            L.pos = L.pos + 2
+            sp = true
+        } else if (isSpace(c)) {
+            sp = true
+            L.bump()
+        } else if (c == 47 && L.at(1) == 47) {
+            sp = true
+            while (L.pos < L.len && L.code() != 10) { L.bump() }
+        } else if (c == 47 && L.at(1) == 42) {
+            sp = true
+            L.bump()
+            L.bump()
+            while (L.pos < L.len && !(L.code() == 42 && L.at(1) == 47)) {
+                if (L.code() == 10) {
+                    L.line = L.line + 1
+                }
+                L.bump()
+            }
+            L.bump()
+            L.bump()
+        } else if (isDigit(c) || (c == 46 && isDigit(L.at(1)))) {
+            var t = readNumber(L)
+            if (t.kind == "er") {
+                throw t.text
+            }
+            t.space = sp
+            sp = false
+            arrays.push(out, t)
+        } else if (isIdentStart(c)) {
+            var ts = L.pos
+            while (isIdentPart(L.code())) { L.bump() }
+            var t = tok("id", strings.substring(L.src, ts, L.pos), 0, 0.0, L.line)
+            t.space = sp
+            sp = false
+            arrays.push(out, t)
+        } else if (c == 34) {
+            var t = readStringBody(L)
+            if (t.kind == "er") {
+                throw t.text
+            }
+            t.space = sp
+            sp = false
+            arrays.push(out, t)
+        } else if (c == 39) {
+            var t = readCharBody(L)
+            if (t.kind == "er") {
+                throw t.text
+            }
+            t.space = sp
+            sp = false
+            arrays.push(out, t)
+        } else {
+            var p = punct(L)
+            if (p == "") {
+                lexError(L, "stray character '" + strings.from_char_code(c) + "'")
+            }
+            var t = tok("pn", p, 0, 0.0, L.line)
+            t.space = sp
+            sp = false
+            arrays.push(out, t)
+        }
+    }
+    var e = tok("eo", "", 0, 0.0, L.line)
+    e.space = true
+    arrays.push(out, e)
+}
+
+// Longest-match punctuator scanning; returns "" when the byte is not a token.
+fun punct(view Lexer L) -> string {
+    // index loops: returning a for-in loop variable miscompiles (empty string)
+    var array[string] tri = ["<<=", ">>=", "..."]
+    var ti = 0
+    while (ti < arrays.length(tri)) {
+        var t = arrays.at(tri, ti)
+        if (matchAt(L, t)) {
+            L.pos = L.pos + strings.length(t)
+            // returning the local t miscompiles; return the element directly
+            return arrays.at(tri, ti)
+        }
+        ti = ti + 1
+    }
+    var array[string] bi = ["->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "##"]
+    var biI = 0
+    while (biI < arrays.length(bi)) {
+        var t = arrays.at(bi, biI)
+        if (matchAt(L, t)) {
+            L.pos = L.pos + 2
+            return arrays.at(bi, biI)
+        }
+        biI = biI + 1
+    }
+    var c = L.code()
+    if (c == 40) { L.bump(); return "(" }
+    if (c == 41) { L.bump(); return ")" }
+    if (c == 123) { L.bump(); return "{" }
+    if (c == 125) { L.bump(); return "}" }
+    if (c == 91) { L.bump(); return "[" }
+    if (c == 93) { L.bump(); return "]" }
+    if (c == 59) { L.bump(); return ";" }
+    if (c == 58) { L.bump(); return ":" }
+    if (c == 44) { L.bump(); return "," }
+    if (c == 46) { L.bump(); return "." }
+    if (c == 43) { L.bump(); return "+" }
+    if (c == 45) { L.bump(); return "-" }
+    if (c == 42) { L.bump(); return "*" }
+    if (c == 47) { L.bump(); return "/" }
+    if (c == 37) { L.bump(); return "%" }
+    if (c == 60) { L.bump(); return "<" }
+    if (c == 62) { L.bump(); return ">" }
+    if (c == 33) { L.bump(); return "!" }
+    if (c == 61) { L.bump(); return "=" }
+    if (c == 38) { L.bump(); return "&" }
+    if (c == 124) { L.bump(); return "|" }
+    if (c == 94) { L.bump(); return "^" }
+    if (c == 126) { L.bump(); return "~" }
+    if (c == 63) { L.bump(); return "?" }
+    if (c == 35) { L.bump(); return "#" }
+    return ""
+}
+
+fun matchAt(view Lexer L, string s) -> bool {
+    var n = strings.length(s)
+    if (L.pos + n > L.len) {
+        return false
+    }
+    var i = 0
+    while (i < n) {
+        if (strings.char_code(L.src, L.pos + i) != strings.char_code(s, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

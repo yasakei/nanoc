@@ -1,0 +1,1156 @@
+// Preprocessor: handles #include "local" (and <stdlib> as a builtin no-op),
+// #define object/function-like macros with rescan, hide sets, # stringize,
+// ## paste, __VA_ARGS__, #ifdef / #ifndef / #if / #elif / #else / #endif,
+// #undef, #error, and passes other directives through ignored.
+use strings
+use arrays
+use fmt
+use sys
+use "lexer.nt"
+
+class Defn {
+    var string name
+    var bool hasParams
+    var bool variadic
+    var array[string] params
+    var array[Token] body
+
+    fun init(string name) {
+        this.name = name
+        this.hasParams = false
+        this.variadic = false
+        this.params = [ ]
+        this.body = [ ]
+    }
+}
+
+// One open conditional (#if family) frame.
+class Cond {
+    var bool taken        // a branch of this chain has been activated
+    var bool parentSkip   // emit state to restore when this frame closes
+
+    fun init(bool taken, bool parentSkip) {
+        this.taken = taken
+        this.parentSkip = parentSkip
+    }
+}
+
+class PP {
+    var array[Defn] defs
+    var bool skipping
+    var array[Cond] conds
+    var array[string] hiddenSet
+    // include stack: file paths, for relative includes and __FILE__
+    var array[string] curFile
+
+    fun init() {
+        this.defs = [ ]
+        this.skipping = false
+        this.conds = [ ]
+        this.hiddenSet = [ ]
+        this.curFile = [ ]
+    }
+
+    fun findDef(view string name) -> int {
+        var n = arrays.length(this.defs)
+        for (var i = 0; i < n; i++) {
+            if (arrays.at(this.defs, i).name == name) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    fun isHidden(view string name) -> bool {
+        return arrays.contains(this.hiddenSet, name)
+    }
+
+    fun hide(view string name) {
+        arrays.push(this.hiddenSet, name)
+    }
+
+    fun unhide(view string name) {
+        var k = arrays.index_of(this.hiddenSet, name)
+        if (k >= 0) {
+            this.hiddenSet = arrays.remove_at(this.hiddenSet, k)
+        }
+    }
+}
+
+// runs the whole preprocessor over one translation unit, appending expanded
+// tokens to out. Fatal errors exit through sys.exit.
+fun preprocess(string source, string filePath, view mut array[Token] out) -> int {
+    var P = PP()
+    arrays.push(P.curFile, filePath)
+    var array[Token] raw = []
+    lex(source, raw)
+    runPP(P, raw, out)
+    if (arrays.length(P.conds) > 0) {
+        say("nanoc: unterminated conditional at end of input")
+        sys.exit(1)
+    }
+    return 0
+}
+
+fun ppFail(int line, string msg) {
+    say("nanoc: line " + line + ": " + msg)
+    sys.exit(1)
+}
+
+fun currentFile(view PP P) -> string {
+    return copy(arrays.at(P.curFile, arrays.length(P.curFile) - 1))
+}
+
+fun sameLine(view Token a, view Token b) -> bool {
+    return a.line == b.line
+}
+
+// Index one past the last token of the directive line that starts at i.
+fun lineEnd(view array[Token] toks, int i) -> int {
+    var n = arrays.length(toks)
+    var line = arrays.at(toks, i).line
+    var j = i + 1
+    while (j < n && arrays.at(toks, j).kind != "eo" && arrays.at(toks, j).line == line) {
+        j = j + 1
+    }
+    return j
+}
+
+// ---------------------------------------------------------------- includes
+
+fun doInclude(view mut PP P, string fname, int line, view mut array[Token] out) {
+    if (arrays.length(P.curFile) > 64) {
+        ppFail(line, "#include nested too deeply")
+        return
+    }
+    if (fname == "stdarg.h" && sys.exists("include/stdarg.h") == false) {
+        var builtin = "#ifndef __NANOC_STDARG_H\n"
+        builtin = builtin + "#define __NANOC_STDARG_H\n"
+        builtin = builtin + "typedef __builtin_va_list va_list;\n"
+        builtin = builtin + "#define va_start(ap, last) __builtin_va_start(ap, last)\n"
+        builtin = builtin + "#define va_arg(ap, type) __builtin_va_arg(ap, type)\n"
+        builtin = builtin + "#define va_end(ap) __builtin_va_end(ap)\n"
+        builtin = builtin + "#endif\n"
+        var array[Token] rawBuiltin = []
+        lex(builtin, rawBuiltin)
+        arrays.push(P.curFile, "<stdarg.h>")
+        runPP(P, rawBuiltin, out)
+        arrays.pop(P.curFile)
+        return
+    }
+    var cur = currentFile(P)
+    var dir = ""
+    var k = strings.last_index_of(cur, "/")
+    if (k >= 0) {
+        dir = strings.substring(cur, 0, k + 1)
+    }
+    var path = dir + fname
+    if (sys.exists(path) == false) {
+        if (sys.exists("include/" + fname)) {
+            path = "include/" + fname
+        } else if (sys.exists(fname)) {
+            path = fname
+        } else if (sys.exists("/usr/include/" + fname)) {
+            path = "/usr/include/" + fname
+        } else {
+            ppFail(line, "include file not found: " + fname)
+            return
+        }
+    }
+    // An active include cycle must not recurse until the depth guard.  A
+    // normal include guard still works: once the guarded file returns it is
+    // removed from this stack and may be included again as C requires.
+    if (arrays.contains(P.curFile, path)) {
+        return
+    }
+    var text = sys.read(path)
+    var array[Token] raw = []
+    lex(text, raw)
+    arrays.push(P.curFile, path)
+    runPP(P, raw, out)
+    arrays.pop(P.curFile)
+}
+
+// ---------------------------------------------------------------- defines
+
+fun defineReplace(view mut PP P, view Defn D) {
+    var di = P.findDef(D.name)
+    if (di >= 0) {
+        var old = arrays.at(P.defs, di)
+        old.hasParams = D.hasParams
+        old.variadic = D.variadic
+        old.params = copy(D.params)
+        old.body = copy(D.body)
+    } else {
+        var saved = copyDefn(D)
+        arrays.push(P.defs, saved)
+    }
+}
+
+// Parses "#define" from toks[j] (the token after the directive name) through
+// end of line. Returns nothing; stores the definition in P.
+fun parseDefine(view mut PP P, view array[Token] toks, int j, int endI) {
+    var n = endI
+    if (j >= n || arrays.at(toks, j).kind != "id") {
+        ppFail(arrays.at(toks, j - 1).line, "macro name missing after #define")
+        return
+    }
+    var nameTok = arrays.at(toks, j)
+    var D = Defn(nameTok.text)
+    j = j + 1
+    // function-like only when "(" immediately follows the name (no space)
+    if (j < n && arrays.at(toks, j).kind == "pn" && arrays.at(toks, j).text == "("
+        && arrays.at(toks, j).space == false) {
+        D.hasParams = true
+        j = j + 1
+        var expectParam = true
+        while (j < n) {
+            var t = arrays.at(toks, j)
+            if (t.kind == "pn" && t.text == ")") {
+                j = j + 1
+                break
+            }
+            if (expectParam == false) {
+                ppFail(t.line, "expected ',' or ')' in macro parameter list")
+                return
+            }
+            if (t.kind == "id") {
+                arrays.push(D.params, t.text)
+                j = j + 1
+            } else if (t.kind == "pn" && t.text == "...") {
+                D.variadic = true
+                arrays.push(D.params, "__VA_ARGS__")
+                j = j + 1
+                if (j < n && arrays.at(toks, j).kind == "pn" && arrays.at(toks, j).text == ")") {
+                    j = j + 1
+                    break
+                }
+                ppFail(t.line, "expected ')' after '...'")
+                return
+            } else {
+                ppFail(t.line, "expected macro parameter name")
+                return
+            }
+            expectParam = false
+            if (j < n && arrays.at(toks, j).kind == "pn" && arrays.at(toks, j).text == ",") {
+                expectParam = true
+                j = j + 1
+            }
+        }
+    }
+    while (j < n) {
+        arrays.push(D.body, arrays.at(toks, j))
+        j = j + 1
+    }
+    defineReplace(P, D)
+}
+
+// ---------------------------------------------------------------- expansion
+
+class Args {
+    var array[array[Token]] list
+    var int after
+
+    fun init() {
+        this.list = [ ]
+        this.after = 0
+    }
+}
+
+// Collects macro call arguments; toks[openI] is "(". Returns the argument
+// lists and the index just past the closing ")".
+fun collectArgs(view array[Token] toks, int openI) -> Args {
+    var A = Args()
+    var n = arrays.length(toks)
+    var array[Token] cur = []
+    var depth = 0
+    var j = openI + 1
+    var closed = false
+    var openLine = arrays.at(toks, openI).line
+    while (j < n) {
+        var a = arrays.at(toks, j)
+        if (a.kind == "eo") {
+            break
+        }
+        if (depth == 0 && a.kind == "pn" && a.text == ")") {
+            closed = true
+            j = j + 1
+            break
+        }
+        if (depth == 0 && a.kind == "pn" && a.text == ",") {
+            arrays.push(A.list, copyTokens(cur))
+            cur = [ ]
+            j = j + 1
+            continue
+        }
+        if (a.kind == "pn" && a.text == "(") {
+            depth = depth + 1
+        }
+        if (a.kind == "pn" && a.text == ")") {
+            depth = depth - 1
+        }
+        arrays.push(cur, copyToken(a))
+        j = j + 1
+    }
+    if (closed == false) {
+        ppFail(openLine, "unterminated macro argument list")
+        return A
+    }
+    arrays.push(A.list, copyTokens(cur))
+    A.after = j
+    return A
+}
+
+fun paramIndex(view Defn D, string name) -> int {
+    var n = arrays.length(D.params)
+    for (var i = 0; i < n; i++) {
+        if (arrays.at(D.params, i) == name) {
+            return i
+        }
+    }
+    return -1
+}
+
+// Token texts joined with single spaces, escaping string/char contents for a
+// string literal body.
+fun argText(view array[Token] toks) -> string {
+    var s = ""
+    var n = arrays.length(toks)
+    for (var i = 0; i < n; i++) {
+        var t = arrays.at(toks, i)
+        if (i > 0) {
+            s = s + " "
+        }
+        if (t.kind == "str" || t.kind == "chr") {
+            var e = strings.replace(t.text, "\\", "\\\\")
+            e = strings.replace(e, "\"", "\\\"")
+            if (t.kind == "str") {
+                s = s + "\\\"" + e + "\\\""
+            } else {
+                s = s + "'" + e + "'"
+            }
+        } else {
+            s = s + t.text
+        }
+    }
+    return s
+}
+
+// Re-lexes a paste result and requires exactly one token.
+fun relex1(string text, int line) -> Token {
+    // Do this without a temporary array.  Besides being cheaper for ##,
+    // this avoids handing class tokens through arrays.push, whose ownership
+    // transfer was incomplete in ntsc 0.1.0.
+    var L = Lexer(copy(text))
+    if (L.len == 0) {
+        ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        return tok("eo", "", 0, 0.0, line)
+    }
+    var c = L.code()
+    if (isIdentStart(c)) {
+        var start = L.pos
+        while (isIdentPart(L.code())) { L.bump() }
+        if (L.pos != L.len) {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        }
+        return tok("id", strings.substring(L.src, start, L.pos), 0, 0.0, line)
+    } else if (isDigit(c) || (c == 46 && isDigit(L.at(1)))) {
+        var number = readNumber(L)
+        number.line = line
+        if (L.pos != L.len) {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        }
+        return number
+    } else if (c == 34) {
+        var str = readStringBody(L)
+        str.line = line
+        if (L.pos != L.len) {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        }
+        return str
+    } else if (c == 39) {
+        var chr = readCharBody(L)
+        chr.line = line
+        if (L.pos != L.len) {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        }
+        return chr
+    } else {
+        var p = punct(L)
+        if (p == "") {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+            return tok("eo", "", 0, 0.0, line)
+        }
+        if (L.pos != L.len) {
+            ppFail(line, "pasting formed \"" + text + "\", which is not a single valid token")
+        }
+        return tok("pn", p, 0, 0.0, line)
+    }
+}
+
+// Substitutes parameters into a function-like macro body, handling #
+// stringize and ## paste. Arguments were pre-expanded by the caller except
+// where the C standard forbids it (operands of # and ##).
+fun substArgs(view mut PP P, view Defn D, view array[array[Token]] args) -> array[Token] {
+    var array[Token] res = []
+    var body = D.body
+    var nb = arrays.length(body)
+    var k = 0
+    var prevPaste = false
+    while (k < nb) {
+        var b = arrays.at(body, k)
+        // # param — stringize
+        if (b.kind == "pn" && b.text == "#" && k + 1 < nb) {
+            var nx = arrays.at(body, k + 1)
+            var pi = paramIndex(D, nx.text)
+            if (pi >= 0 && nx.kind == "id") {
+                var s = argText(arrays.at(args, pi))
+                var st = tok("str", s, 0, 0.0, b.line)
+                st.space = b.space
+                arrays.push(res, st)
+                k = k + 2
+                prevPaste = false
+                continue
+            }
+        }
+        // ## paste
+        if (b.kind == "pn" && b.text == "##" && k + 1 < nb && arrays.length(res) > 0) {
+            var last = arrays.length(res) - 1
+            var leftText = copy(arrays.at(res, last).text)
+            var leftKind = copy(arrays.at(res, last).kind)
+            var nxText = copy(arrays.at(body, k + 1).text)
+            var array[Token] withoutLeft = []
+            var leftI = 0
+            while (leftI < last) {
+                arrays.push(withoutLeft, copyToken(arrays.at(res, leftI)))
+                leftI = leftI + 1
+            }
+            res = withoutLeft
+            var pi = paramIndex(D, copy(nxText))
+            if (pi >= 0 && arrays.at(body, k + 1).kind == "id") {
+                view var atoks = args[pi]
+                if (arrays.length(atoks) == 0) {
+                    // GNU extension: ", ## __VA_ARGS__" drops the comma when empty
+                    if (leftKind == "pn" && leftText == ",") {
+                        k = k + 2
+                        prevPaste = true
+                        continue
+                    }
+                    arrays.push(res, copyToken(arrays.at(body, k)))
+                    k = k + 2
+                    prevPaste = true
+                    continue
+                }
+                // GNU's comma-swallowing form is not a literal paste when
+                // variadic arguments are present: keep the comma and append
+                // the variadic tokens normally.
+                if (leftKind == "pn" && leftText == ","
+                    && nxText == "__VA_ARGS__") {
+                    arrays.push(res, tok("pn", ",", 0, 0.0, b.line))
+                    var vaI = 0
+                    while (vaI < arrays.length(atoks)) {
+                        arrays.push(res, copyToken(arrays.at(atoks, vaI)))
+                        vaI = vaI + 1
+                    }
+                    k = k + 2
+                    prevPaste = false
+                    continue
+                }
+                var firstText = copy(atoks[0].text)
+                var pt = relex1(leftText + firstText, b.line)
+                pt.line = b.line
+                arrays.push(res, pt)
+                var m = 1
+                while (m < arrays.length(atoks)) {
+                    arrays.push(res, arrays.at(atoks, m))
+                    m = m + 1
+                }
+            } else {
+                var pt = relex1(leftText + nxText, b.line)
+                pt.line = b.line
+                arrays.push(res, pt)
+            }
+            k = k + 2
+            prevPaste = true
+            continue
+        }
+        // parameter substitution
+        if (b.kind == "id") {
+            var pi = paramIndex(D, b.text)
+            if (pi >= 0) {
+                var nextPaste = false
+                if (k + 1 < nb && arrays.at(body, k + 1).kind == "pn"
+                    && arrays.at(body, k + 1).text == "##") {
+                    nextPaste = true
+                }
+                view var atoks = args[pi]
+                if (prevPaste || nextPaste) {
+                    var substStart = arrays.length(res)
+                    var m = 0
+                    while (m < arrays.length(atoks)) {
+                        arrays.push(res, copyToken(arrays.at(atoks, m)))
+                        m = m + 1
+                    }
+                    if (arrays.length(res) > substStart) {
+                        arrays.at(res, substStart).space = b.space
+                    }
+                } else {
+                    var array[Token] ex = []
+                    expandAll(P, atoks, ex)
+                    var substStart2 = arrays.length(res)
+                    var m = 0
+                    while (m < arrays.length(ex)) {
+                        arrays.push(res, copyToken(arrays.at(ex, m)))
+                        m = m + 1
+                    }
+                    if (arrays.length(res) > substStart2) {
+                        arrays.at(res, substStart2).space = b.space
+                    }
+                }
+                k = k + 1
+                prevPaste = false
+                continue
+            }
+        }
+        arrays.push(res, copyToken(b))
+        k = k + 1
+        prevPaste = false
+    }
+    return res
+}
+
+// Fresh copy of a token; arrays share element references without
+// adjusting ownership, so a token landing in a second array must be copied.
+fun copyToken(view Token t) -> Token {
+    var c = Token(copy(t.kind), copy(t.text), t.ival, t.fval, t.line)
+    c.space = t.space
+    c.file = copy(t.file)
+    return c
+}
+
+fun copyTokens(view array[Token] src) -> array[Token] {
+    var array[Token] out = []
+    var i = 0
+    while (i < arrays.length(src)) {
+        arrays.push(out, copyToken(arrays.at(src, i)))
+        i = i + 1
+    }
+    return out
+}
+
+// Macro replacement lists are written on the #define line, but preprocessing
+// output attributes their spelling to the invocation line.  Retag the fresh
+// range after expansion and carry the invocation's leading whitespace onto
+// its first replacement token.
+fun retagExpansion(view mut array[Token] out, int start, int line, string file, bool leadingSpace) {
+    var i = start
+    while (i < arrays.length(out)) {
+        var t = arrays.at(out, i)
+        t.line = line
+        t.file = copy(file)
+        if (i == start) {
+            t.space = leadingSpace
+        }
+        i = i + 1
+    }
+}
+
+// Definitions outlive the token stream and the local Defn built by
+// parseDefine.  Do not retain the borrowed class/array elements directly:
+// ntsc 0.1.0's array push does not retain a view of a class element.
+fun copyDefn(view Defn D) -> Defn {
+    var c = Defn(copy(D.name))
+    c.hasParams = D.hasParams
+    c.variadic = D.variadic
+    c.params = copy(D.params)
+    c.body = []
+    var i = 0
+    while (i < arrays.length(D.body)) {
+        arrays.push(c.body, copyToken(arrays.at(D.body, i)))
+        i = i + 1
+    }
+    return c
+}
+
+// Expands one token (and, for a function-like macro, its argument list)
+// starting at i; appends results to out. Returns the next unconsumed index.
+fun expandAt(view mut PP P, view array[Token] toks, int i, view mut array[Token] out) -> int {
+    var t = arrays.at(toks, i)
+    if (t.kind != "id") {
+        arrays.push(out, copyToken(t))
+        return i + 1
+    }
+    // builtin macros
+    if (t.text == "__LINE__") {
+        var bt = tok("num", "" + t.line, t.line, 0.0, t.line)
+        bt.space = t.space
+        bt.file = copy(currentFile(P))
+        arrays.push(out, bt)
+        return i + 1
+    }
+    if (t.text == "__FILE__") {
+        var bt = tok("str", currentFile(P), 0, 0.0, t.line)
+        bt.space = t.space
+        bt.file = copy(currentFile(P))
+        arrays.push(out, bt)
+        return i + 1
+    }
+    if (t.text == "__STDC__") {
+        var bt = tok("num", "1", 1, 0.0, t.line)
+        bt.space = t.space
+        bt.file = copy(currentFile(P))
+        arrays.push(out, bt)
+        return i + 1
+    }
+    var di = P.findDef(t.text)
+    if (di < 0 || P.isHidden(t.text)) {
+        arrays.push(out, copyToken(t))
+        return i + 1
+    }
+    var D = arrays.at(P.defs, di)
+    if (D.hasParams == false) {
+        P.hide(t.text)
+        var begin = arrays.length(out)
+        expandAll(P, D.body, out)
+        retagExpansion(out, begin, t.line, currentFile(P), t.space)
+        P.unhide(t.text)
+        return i + 1
+    }
+    // function-like: requires "(" as the next token
+    var n = arrays.length(toks)
+    if (i + 1 >= n) {
+        arrays.push(out, copyToken(t))
+        return i + 1
+    }
+    var nx = arrays.at(toks, i + 1)
+    if (nx.kind != "pn" || nx.text != "(") {
+        arrays.push(out, copyToken(t))
+        return i + 1
+    }
+    var A = collectArgs(toks, i + 1)
+    var args = fitArgs(P, D, A.list, t.line)
+    var body = substArgs(P, D, args)
+    P.hide(t.text)
+    var begin2 = arrays.length(out)
+    expandAll(P, body, out)
+    retagExpansion(out, begin2, t.line, currentFile(P), t.space)
+    P.unhide(t.text)
+    return A.after
+}
+
+// Adjusts collected arguments to the parameter list: joins trailing
+// arguments for __VA_ARGS__ and validates the count. Returns a fresh list.
+fun fitArgs(view mut PP P, view Defn D, view array[array[Token]] raw, int line) -> array[array[Token]] {
+    var np = arrays.length(D.params)
+    var nn = np
+    if (D.variadic) {
+        nn = np - 1
+    }
+    var na = arrays.length(raw)
+    if (nn == 0 && na == 1 && D.variadic == false) {
+        // zero-parameter macro invoked as F()
+        var array[array[Token]] empty = []
+        return empty
+    }
+    if (D.variadic == false && na != nn) {
+        ppFail(line, "macro \"" + D.name + "\" passed " + na + " arguments, but takes " + nn)
+        var array[array[Token]] none1 = []
+        return none1
+    }
+    if (D.variadic && na < nn) {
+        ppFail(line, "macro \"" + D.name + "\" passed " + na + " arguments, but takes at least " + nn)
+        var array[array[Token]] none2 = []
+        return none2
+    }
+    var array[array[Token]] outv = []
+    var i = 0
+    while (i < nn) {
+        arrays.push(outv, copyTokens(arrays.at(raw, i)))
+        i = i + 1
+    }
+    if (D.variadic) {
+        var array[Token] va = []
+        while (i < na) {
+            if (i > nn) {
+                var comma = tok("pn", ",", 0, 0.0, line)
+                arrays.push(va, comma)
+            }
+            var a = arrays.at(raw, i)
+            var m = 0
+            while (m < arrays.length(a)) {
+                arrays.push(va, copyToken(arrays.at(a, m)))
+                m = m + 1
+            }
+            i = i + 1
+        }
+        arrays.push(outv, copyTokens(va))
+    }
+    return outv
+}
+
+// Expands every token of toks into out (no directives inside macro bodies).
+fun expandAll(view mut PP P, view array[Token] toks, view mut array[Token] out) {
+    var i = 0
+    var n = arrays.length(toks)
+    while (i < n) {
+        var t = arrays.at(toks, i)
+        if (t.kind == "eo") {
+            return
+        }
+        i = expandAt(P, toks, i, out)
+    }
+}
+
+// ------------------------------------------------------------- conditionals
+
+class Cur {
+    var array[Token] toks
+    var int i
+
+    fun init(array[Token] t) {
+        this.toks = t
+        this.i = 0
+    }
+
+    fun peek() -> Token {
+        return arrays.at(this.toks, this.i)
+    }
+
+    fun isOp(string s) -> bool {
+        var t = this.peek()
+        return t.kind == "pn" && t.text == s
+    }
+}
+
+// Evaluates a #if / #elif constant expression spanning toks[start..end).
+fun evalCondExpr(view mut PP P, view array[Token] toks, int start, int endI, int line) -> bool {
+    // 1. resolve defined X / defined(X) before any expansion
+    var array[Token] pre = []
+    var i = start
+    while (i < endI) {
+        var t = arrays.at(toks, i)
+        if (t.kind == "id" && t.text == "defined") {
+            i = i + 1
+            var name = ""
+            if (i < endI && arrays.at(toks, i).kind == "id") {
+                name = arrays.at(toks, i).text
+                i = i + 1
+            } else if (i < endI && arrays.at(toks, i).kind == "pn"
+                       && arrays.at(toks, i).text == "(") {
+                i = i + 1
+                if (i < endI && arrays.at(toks, i).kind == "id") {
+                    name = arrays.at(toks, i).text
+                    i = i + 1
+                }
+                if (i < endI && arrays.at(toks, i).kind == "pn"
+                    && arrays.at(toks, i).text == ")") {
+                    i = i + 1
+                }
+            }
+            if (name == "") {
+                ppFail(t.line, "operator 'defined' requires an identifier")
+                return false
+            }
+            var v = 0
+            if (P.findDef(name) >= 0) {
+                v = 1
+            }
+            var nt = tok("num", "" + v, v, 0.0, t.line)
+            nt.space = t.space
+            arrays.push(pre, nt)
+        } else {
+            arrays.push(pre, t)
+            i = i + 1
+        }
+    }
+    // 2. macro-expand the rest
+    var array[Token] ex = []
+    expandAll(P, pre, ex)
+    // 3. replace remaining identifiers with 0, char constants with their value
+    var array[Token] final = []
+    var m = arrays.length(ex)
+    for (var k = 0; k < m; k++) {
+        var t = arrays.at(ex, k)
+        if (t.kind == "id") {
+            var z = tok("num", "0", 0, 0.0, t.line)
+            z.space = t.space
+            arrays.push(final, z)
+        } else if (t.kind == "chr") {
+            var cv = tok("num", "" + t.ival, t.ival, 0.0, t.line)
+            cv.space = t.space
+            arrays.push(final, cv)
+        } else if (t.kind == "flo") {
+            ppFail(t.line, "floating constant in preprocessor expression")
+            return false
+        } else if (t.kind != "eo") {
+            arrays.push(final, t)
+        }
+    }
+    // The evaluator peeks after the final operand.  Keep a sentinel so a
+    // complete expression does not index past the temporary token array.
+    arrays.push(final, tok("eo", "", 0, 0.0, line))
+    // 4. evaluate
+    var C = Cur(final)
+    var v = evExpr(C)
+    return v != 0
+}
+
+fun evPrimary(view mut Cur C) -> int {
+    var t = C.peek()
+    if (t.kind == "num") {
+        C.i = C.i + 1
+        return t.ival
+    }
+    if (t.kind == "pn" && t.text == "(") {
+        C.i = C.i + 1
+        var v = evExpr(C)
+        if (C.isOp(")") == false) {
+            ppFail(t.line, "expected ')' in preprocessor expression")
+            return 0
+        }
+        C.i = C.i + 1
+        return v
+    }
+    ppFail(t.line, "unexpected token in preprocessor expression")
+    return 0
+}
+
+fun evUnary(view mut Cur C) -> int {
+    var t = C.peek()
+    if (t.kind == "pn" && t.text == "!") {
+        C.i = C.i + 1
+        if (evUnary(C) == 0) { return 1 }
+        return 0
+    }
+    if (t.kind == "pn" && t.text == "~") {
+        C.i = C.i + 1
+        return -1 ^ evUnary(C)
+    }
+    if (t.kind == "pn" && t.text == "-") {
+        C.i = C.i + 1
+        return 0 - evUnary(C)
+    }
+    if (t.kind == "pn" && t.text == "+") {
+        C.i = C.i + 1
+        return evUnary(C)
+    }
+    return evPrimary(C)
+}
+
+// Binary operator precedence (higher binds tighter).
+fun binPrec(string op) -> int {
+    if (op == "||") { return 1 }
+    if (op == "&&") { return 2 }
+    if (op == "|") { return 3 }
+    if (op == "^") { return 4 }
+    if (op == "&") { return 5 }
+    if (op == "==" || op == "!=") { return 6 }
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") { return 7 }
+    if (op == "<<" || op == ">>") { return 8 }
+    if (op == "+" || op == "-") { return 9 }
+    if (op == "*" || op == "/" || op == "%") { return 10 }
+    return 0
+}
+
+fun evExpr(view mut Cur C) -> int {
+    return evBin(C, 1)
+}
+
+fun evBin(view mut Cur C, int minPrec) -> int {
+    var lhs = evUnary(C)
+    while (true) {
+        var t = C.peek()
+        if (t.kind != "pn") {
+            return lhs
+        }
+        // ternary
+        if (t.text == "?") {
+            C.i = C.i + 1
+            var a = evExpr(C)
+            if (C.isOp(":") == false) {
+                ppFail(t.line, "expected ':' in preprocessor expression")
+                return 0
+            }
+            C.i = C.i + 1
+            var b = evBin(C, 1)
+            if (lhs != 0) { lhs = a } else { lhs = b }
+            continue
+        }
+        var p = binPrec(t.text)
+        if (p < minPrec) {
+            return lhs
+        }
+        var op = t.text
+        C.i = C.i + 1
+        var rhs = evBin(C, p + 1)
+        lhs = evApply(t.line, op, lhs, rhs)
+    }
+}
+
+fun evApply(int line, string op, int a, int b) -> int {
+    if (op == "||") {
+        if (a != 0 || b != 0) { return 1 }
+        return 0
+    }
+    if (op == "&&") {
+        if (a != 0 && b != 0) { return 1 }
+        return 0
+    }
+    if (op == "|") { return a | b }
+    if (op == "^") { return a ^ b }
+    if (op == "&") { return a & b }
+        if (op == "==") {
+        if (a == b) { return 1 }
+        return 0
+    }
+        if (op == "!=") {
+        if (a != b) { return 1 }
+        return 0
+    }
+        if (op == "<") {
+        if (a < b) { return 1 }
+        return 0
+    }
+        if (op == ">") {
+        if (a > b) { return 1 }
+        return 0
+    }
+        if (op == "<=") {
+        if (a <= b) { return 1 }
+        return 0
+    }
+        if (op == ">=") {
+        if (a >= b) { return 1 }
+        return 0
+    }
+    if (op == "<<") { return a << b }
+    if (op == ">>") { return a >> b }
+    if (op == "+") { return a + b }
+    if (op == "-") { return a - b }
+    if (op == "*") { return a * b }
+    if (op == "/") {
+        if (b == 0) {
+            ppFail(line, "division by zero in preprocessor expression")
+            return 0
+        }
+        return a / b
+    }
+    if (op == "%") {
+        if (b == 0) {
+            ppFail(line, "division by zero in preprocessor expression")
+            return 0
+        }
+        return a % b
+    }
+    ppFail(line, "unknown operator in preprocessor expression")
+    return 0
+}
+
+// ---------------------------------------------------------------- main loop
+
+// Handles one directive; toks[i] is "#". Returns the index one past the
+// directive line.
+fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[Token] out) -> int {
+    var endI = lineEnd(toks, i)
+    var n = arrays.length(toks)
+    var j = i + 1
+    var hashTok = arrays.at(toks, i)
+    // null directive or "# <number>" line marker
+    if (j >= n || arrays.at(toks, j).kind == "eo" || sameLine(hashTok, arrays.at(toks, j)) == false) {
+        return endI
+    }
+    var nameTok = arrays.at(toks, j)
+    if (nameTok.kind == "num") {
+        return endI
+    }
+    if (nameTok.kind != "id") {
+        ppFail(nameTok.line, "expected directive name after '#'")
+        return endI
+    }
+    var name = nameTok.text
+    j = j + 1
+
+    if (name == "ifdef" || name == "ifndef") {
+        if (P.skipping) {
+            arrays.push(P.conds, Cond(false, true))
+            return endI
+        }
+        if (j >= endI || arrays.at(toks, j).kind != "id") {
+            ppFail(nameTok.line, "expected macro name after #" + name)
+            return endI
+        }
+        var has = P.findDef(arrays.at(toks, j).text) >= 0
+        var truth = has
+        if (name == "ifndef") {
+            truth = has == false
+        }
+        arrays.push(P.conds, Cond(truth, false))
+        P.skipping = truth == false
+        return endI
+    }
+    if (name == "if") {
+        if (P.skipping) {
+            arrays.push(P.conds, Cond(false, true))
+            return endI
+        }
+        var truth = evalCondExpr(P, toks, j, endI, nameTok.line)
+        arrays.push(P.conds, Cond(truth, false))
+        P.skipping = truth == false
+        return endI
+    }
+    if (name == "elif") {
+        var nc = arrays.length(P.conds)
+        if (nc == 0) {
+            ppFail(nameTok.line, "#elif without #if")
+            return endI
+        }
+        var F = arrays.at(P.conds, nc - 1)
+        if (P.skipping == false) {
+            // this frame's branch was taken: skip the remainder
+            P.skipping = true
+        } else if (F.taken == false && F.parentSkip == false) {
+            var truth = evalCondExpr(P, toks, j, endI, nameTok.line)
+            if (truth) {
+                P.skipping = false
+                F.taken = true
+            }
+        }
+        return endI
+    }
+    if (name == "else") {
+        var nc = arrays.length(P.conds)
+        if (nc == 0) {
+            ppFail(nameTok.line, "#else without #if")
+            return endI
+        }
+        var F = arrays.at(P.conds, nc - 1)
+        if (P.skipping == false) {
+            P.skipping = true
+        } else if (F.taken == false && F.parentSkip == false) {
+            P.skipping = false
+            F.taken = true
+        }
+        return endI
+    }
+    if (name == "endif") {
+        var nc = arrays.length(P.conds)
+        if (nc == 0) {
+            ppFail(nameTok.line, "#endif without #if")
+            return endI
+        }
+        var F = arrays.pop(P.conds)
+        P.skipping = F.parentSkip
+        return endI
+    }
+
+    // everything below is ignored while skipping
+    if (P.skipping) {
+        return endI
+    }
+    if (name == "define") {
+        parseDefine(P, toks, j, endI)
+        return endI
+    }
+    if (name == "undef") {
+        if (j >= endI || arrays.at(toks, j).kind != "id") {
+            ppFail(nameTok.line, "expected macro name after #undef")
+            return endI
+        }
+        var di = P.findDef(arrays.at(toks, j).text)
+        if (di >= 0) {
+            P.defs = arrays.remove_at(P.defs, di)
+        }
+        return endI
+    }
+    if (name == "include") {
+        if (j >= endI) {
+            ppFail(nameTok.line, "expected file name after #include")
+            return endI
+        }
+        var ft = arrays.at(toks, j)
+        if (ft.kind == "str") {
+            doInclude(P, ft.text, ft.line, out)
+            return endI
+        }
+        if (ft.kind == "pn" && ft.text == "<") {
+            var fname = ""
+            var k = j + 1
+            while (k < endI && arrays.at(toks, k).text != ">") {
+                fname = fname + copy(arrays.at(toks, k).text)
+                k = k + 1
+            }
+            if (k >= endI) { ppFail(nameTok.line, "unterminated system include") }
+            doInclude(P, fname, ft.line, out)
+            return endI
+        }
+        // computed include: expand the line and retry
+        var array[Token] ex = []
+        expandAll(P, arrays.slice(toks, j, endI), ex)
+        if (arrays.length(ex) > 0) {
+            var e0 = arrays.at(ex, 0)
+            if (e0.kind == "str") {
+                doInclude(P, e0.text, e0.line, out)
+                return endI
+            }
+            if (e0.kind == "pn" && e0.text == "<") {
+                var fname2 = ""
+                var k2 = 1
+                while (k2 < arrays.length(ex) && arrays.at(ex, k2).text != ">") {
+                    fname2 = fname2 + copy(arrays.at(ex, k2).text)
+                    k2 = k2 + 1
+                }
+                if (k2 >= arrays.length(ex)) { ppFail(nameTok.line, "unterminated system include") }
+                doInclude(P, fname2, e0.line, out)
+                return endI
+            }
+        }
+        ppFail(nameTok.line, "expected \"FILE\" or <FILE> after #include")
+        return endI
+    }
+    if (name == "error") {
+        var msg = ""
+        while (j < endI) {
+            msg = msg + arrays.at(toks, j).text
+            j = j + 1
+        }
+        ppFail(nameTok.line, "#error " + msg)
+        return endI
+    }
+    if (name == "warning" || name == "pragma" || name == "line") {
+        return endI
+    }
+    ppFail(nameTok.line, "unknown directive #" + name)
+    return endI
+}
+
+// Processes one file's token stream: directives, conditional skipping, and
+// macro expansion, appending to out.
+fun runPP(view mut PP P, view array[Token] toks, view mut array[Token] out) {
+    var condBase = arrays.length(P.conds)
+    var prevLine = -1
+    var i = 0
+    var n = arrays.length(toks)
+    while (i < n) {
+        var t = arrays.at(toks, i)
+        if (t.file == "") {
+            t.file = copy(currentFile(P))
+        }
+        if (t.kind == "eo") {
+            if (arrays.length(P.conds) != condBase) {
+                ppFail(t.line, "unterminated conditional at end of file")
+            }
+            return
+        }
+        if (t.kind == "pn" && t.text == "#" && t.line != prevLine) {
+            i = runDirective(P, toks, i, out)
+            prevLine = -1
+            continue
+        }
+        if (P.skipping == false) {
+            i = expandAt(P, toks, i, out)
+        } else {
+            i = i + 1
+        }
+        prevLine = t.line
+    }
+}

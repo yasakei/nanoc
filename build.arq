@@ -1,0 +1,20 @@
+task build {
+    run "ntsc build"
+}
+
+task test {
+    build
+    exec("python3", ["tests/preprocessor_compare.py"])
+    run "./build/debug/nanoc -o /tmp/nanoc-stdio tests/c/stdio.c"
+    run "/tmp/nanoc-stdio"
+    run "./build/debug/nanoc -o /tmp/nanoc-headers tests/c/headers.c"
+    run "/tmp/nanoc-headers"
+    run "./build/debug/nanoc -o /tmp/nanoc-variadic tests/c/variadic.c"
+    run "/tmp/nanoc-variadic"
+    run "./build/debug/nanoc -o /tmp/nanoc-int-width tests/c/int_width.c"
+    run "/tmp/nanoc-int-width"
+}
+
+task check {
+    test
+}

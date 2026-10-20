@@ -1,0 +1,149 @@
+// nanoc — a small C compiler written in Neutron.
+//
+// -E keeps the preprocessor driver useful for differential testing.
+// The default path now lowers the integer-first C subset to x86-64 assembly
+// and invokes the system assembler/linker, with textual assembly as the first
+// backend boundary.
+use "pp.nt"
+use "parse.nt"
+use "codegen.nt"
+use arrays
+use sys
+use process
+
+fun dumpPreprocessed(view string path, view array[Token] toks) {
+    var n = arrays.length(toks)
+    var i = 0
+    var lastLine = 0
+    var lastFile = copy(path)
+    var buf = ""
+    while (i < n) {
+        var t = arrays.at(toks, i)
+        if (t.kind == "eo") {
+            break
+        }
+        var tFile = t.file
+        if (tFile == "") {
+            tFile = copy(path)
+        }
+        if (t.line != lastLine || tFile != lastFile) {
+            if (buf != "") {
+                say(buf)
+                buf = ""
+            }
+            var gap = t.line - lastLine
+            if (lastLine == 0 || gap > 1 || t.line < lastLine || tFile != lastFile) {
+                say("# " + t.line + " \"" + tFile + "\"")
+            }
+            lastLine = t.line
+            lastFile = copy(tFile)
+        }
+        if (t.space && buf != "") {
+            buf = buf + " "
+        }
+        var rendered = t.text
+        if (t.kind == "str") {
+            rendered = "\"" + t.text + "\""
+        } else if (t.kind == "chr") {
+            rendered = "'" + t.text + "'"
+        }
+        buf = buf + rendered
+        i = i + 1
+    }
+    if (buf != "") {
+        say(buf)
+    }
+}
+
+fun loadTokens(string path, view mut array[Token] toks) -> int {
+    if (sys.exists(path) == false) {
+        say("nanoc: no such file: " + path)
+        return 1
+    }
+    var text = sys.read(path)
+    try {
+        preprocess(text, copy(path), toks)
+    } catch (err) {
+        say(err)
+        return 1
+    }
+    return 0
+}
+
+fun main() {
+    var args = sys.args()
+    if (arrays.length(args) < 2) {
+        say("usage: nanoc [-E|-S] [-o output] file.c")
+        sys.exit(1)
+    }
+    var mode = "compile"
+    var output = "a.out"
+    var path = ""
+    var i = 1
+    while (i < arrays.length(args)) {
+        var a = arrays.at(args, i)
+        if (a == "-E") {
+            mode = "preprocess"
+        } else if (a == "-S") {
+            mode = "assembly"
+        } else if (a == "-c") {
+            mode = "compile"
+        } else if (a == "-o") {
+            i = i + 1
+            if (i >= arrays.length(args)) {
+                say("nanoc: -o requires an output path")
+                sys.exit(1)
+            }
+            output = arrays.at(args, i)
+        } else {
+            path = a
+        }
+        i = i + 1
+    }
+    if (path == "") {
+        say("nanoc: no input file")
+        sys.exit(1)
+    }
+    var array[Token] toks = []
+    if (loadTokens(copy(path), toks) != 0) {
+        sys.exit(1)
+    }
+    if (mode == "preprocess") {
+        var Cpp = Compiler()
+        try {
+            parseTranslationUnit(Cpp, toks)
+        } catch (err) {
+            say(err)
+            sys.exit(1)
+        }
+        dumpPreprocessed(copy(path), toks)
+        return
+    }
+    var C = Compiler()
+    var asm = ""
+    try {
+        asm = compileTranslationUnit(C, toks)
+    } catch (err) {
+        say(err)
+        sys.exit(1)
+    }
+    var asmPath = copy(output) + ".nanoc.s"
+    if (mode == "assembly") {
+        asmPath = copy(output)
+        if (output == "a.out") {
+            asmPath = copy(path) + ".s"
+        }
+    }
+    if (sys.write(copy(asmPath), copy(asm)) == false) {
+        say("nanoc: cannot write " + asmPath)
+        sys.exit(1)
+    }
+    if (mode == "assembly") {
+        return
+    }
+    var status = process.exec("cc -no-pie -o " + copy(output) + " " + copy(asmPath))
+    if (status != 0) {
+        say("nanoc: linker failed")
+        sys.exit(status)
+    }
+}

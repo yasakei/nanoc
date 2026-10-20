@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+*.nanoc.s
+*.s
+a.out
+*.out
+*.bin
+.DS_Store

@@ -1,0 +1,688 @@
+// First C parser layer.  It deliberately keeps the compiler's type model
+// independent from LLVM: types are the canonical strings documented by
+// ctype.nt, and later code generation can consume the collected symbols.
+use strings
+use arrays
+use fmt
+use "pp.nt"
+use "ctype.nt"
+
+fun compilerFind(view Compiler C, view string name) -> int {
+    var i = 0
+    while (i < arrays.length(C.globals)) {
+        if (arrays.at(C.globals, i).name == name) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fun compilerAdd(view mut Compiler C, view Symbol S) {
+    var old = compilerFind(C, S.name)
+    if (old >= 0) {
+        var prior = arrays.at(C.globals, old)
+        prior.name = copy(S.name)
+        prior.ctype = copy(S.ctype)
+        prior.line = S.line
+        prior.function = S.function
+        prior.typedef = S.typedef
+        prior.params = copy(S.params)
+    } else {
+        arrays.push(C.globals, copy(S))
+    }
+}
+
+fun compilerTypedef(view Compiler C, view string name) -> string {
+    var i = arrays.length(C.typedefNames) - 1
+    while (i >= 0) {
+        if (arrays.at(C.typedefNames, i) == name) {
+            return copy(arrays.at(C.typedefTypes, i))
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+class Cursor {
+    var array[Token] toks
+    var int i
+
+    fun init(array[Token] toks) {
+        this.toks = toks
+        this.i = 0
+    }
+
+    fun peek() -> Token {
+        if (this.i >= arrays.length(this.toks)) {
+            return tok("eo", "", 0, 0.0, 0)
+        }
+        return arrays.at(this.toks, this.i)
+    }
+
+    fun atEnd() -> bool {
+        if (this.i >= arrays.length(this.toks)) {
+            return true
+        }
+        return arrays.at(this.toks, this.i).kind == "eo"
+    }
+
+    fun take() -> Token {
+        if (this.i >= arrays.length(this.toks)) {
+            return Token("eo", "", 0, 0.0, 0)
+        }
+        var t = this.peek()
+        this.i = this.i + 1
+        return t
+    }
+
+    fun isPunct(string s) -> bool {
+        var t = this.peek()
+        return t.kind == "pn" && t.text == s
+    }
+
+    fun isWord(string s) -> bool {
+        var t = this.peek()
+        return t.kind == "id" && t.text == s
+    }
+}
+
+fun parseFail(view Cursor C, string msg) {
+    throw "nanoc: line " + C.peek().line + ": " + msg
+}
+
+fun isTypeWord(view Cursor C) -> bool {
+    var t = C.peek()
+    if (t.kind != "id") {
+        return false
+    }
+    return t.text == "const" || t.text == "volatile" || t.text == "restrict"
+        || t.text == "static" || t.text == "extern" || t.text == "void" || t.text == "char" || t.text == "short"
+        || t.text == "int" || t.text == "long" || t.text == "float"
+        || t.text == "double" || t.text == "signed" || t.text == "unsigned"
+        || t.text == "_Bool" || t.text == "__builtin_va_list"
+        || t.text == "__gnuc_va_list" || t.text == "va_list" || t.text == "FILE" || t.text == "size_t"
+        || t.text == "fpos_t" || t.text == "ptrdiff_t" || t.text == "ssize_t"
+        || t.text == "wchar_t" || t.text == "_Atomic"
+        || t.text == "__SIZE_TYPE__" || t.text == "__PTRDIFF_TYPE__"
+        || t.text == "__WCHAR_TYPE__" || t.text == "__WINT_TYPE__"
+        || t.text == "int8_t" || t.text == "uint8_t" || t.text == "int16_t" || t.text == "uint16_t"
+        || t.text == "int32_t" || t.text == "uint32_t" || t.text == "int64_t" || t.text == "uint64_t"
+        || t.text == "int_least8_t" || t.text == "uint_least8_t"
+        || t.text == "int_least16_t" || t.text == "uint_least16_t"
+        || t.text == "int_least32_t" || t.text == "uint_least32_t"
+        || t.text == "int_least64_t" || t.text == "uint_least64_t"
+        || t.text == "int_fast8_t" || t.text == "uint_fast8_t"
+        || t.text == "int_fast16_t" || t.text == "uint_fast16_t"
+        || t.text == "int_fast32_t" || t.text == "uint_fast32_t"
+        || t.text == "int_fast64_t" || t.text == "uint_fast64_t"
+        || t.text == "intptr_t" || t.text == "uintptr_t"
+        || t.text == "intmax_t" || t.text == "uintmax_t"
+        || t.text == "memory_order" || t.text == "atomic_bool" || t.text == "atomic_char"
+        || t.text == "atomic_schar" || t.text == "atomic_uchar" || t.text == "atomic_short"
+        || t.text == "atomic_ushort" || t.text == "atomic_int" || t.text == "atomic_uint"
+        || t.text == "atomic_long" || t.text == "atomic_ulong" || t.text == "atomic_llong"
+        || t.text == "atomic_ullong" || t.text == "atomic_wchar_t"
+        || t.text == "struct" || t.text == "union"
+}
+
+fun isCompilerType(view Cursor P, view Compiler C) -> bool {
+    if (isTypeWord(P)) { return true }
+    var t = P.peek()
+    if (t.kind != "id") { return false }
+    return compilerTypedef(C, t.text) != ""
+}
+
+fun parseCompilerBaseType(view mut Cursor P, view Compiler C) -> string {
+    var t = P.peek()
+    if (t.kind == "id") {
+        var alias = compilerTypedef(C, t.text)
+        if (alias != "") {
+            P.take()
+            return alias
+        }
+    }
+    return parseBaseType(P)
+}
+
+fun parseBaseType(view mut Cursor C) -> string {
+    var unsigned = false
+    var signed = false
+    while (C.isWord("const") || C.isWord("volatile") || C.isWord("restrict")) {
+        C.take()
+    }
+    if (C.isWord("unsigned")) {
+        C.take()
+        unsigned = true
+    } else if (C.isWord("signed")) {
+        C.take()
+        signed = true
+    }
+    while (C.isWord("const") || C.isWord("volatile") || C.isWord("restrict")) {
+        C.take()
+    }
+    if (C.isWord("long")) {
+        C.take()
+        if (C.isWord("long")) {
+            C.take()
+        }
+        if (C.isWord("int")) {
+            C.take()
+        }
+        if (unsigned) { return "u64" }
+        return "i64"
+    }
+    if (C.isWord("short")) {
+        C.take()
+        if (C.isWord("int")) {
+            C.take()
+        }
+        if (unsigned) { return "u16" }
+        return "i16"
+    }
+    if (unsigned && C.isWord("int") == false && C.isWord("char") == false) {
+        return "u32"
+    }
+    if (signed && C.isWord("int") == false && C.isWord("char") == false) {
+        return "i32"
+    }
+    var t = C.take()
+    if (t.kind != "id") {
+        parseFail(C, "expected type name")
+    }
+    if (t.text == "struct" || t.text == "union") {
+        var n = C.take()
+        if (n.kind == "pn" && n.text == "{") {
+            var depth = 1
+            while (C.atEnd() == false && depth > 0) {
+                var bodyTok = C.take()
+                if (bodyTok.kind == "pn" && bodyTok.text == "{") { depth = depth + 1 }
+                if (bodyTok.kind == "pn" && bodyTok.text == "}") { depth = depth - 1 }
+            }
+            return "i32"
+        }
+        if (n.kind != "id") {
+            parseFail(C, "expected struct tag")
+        }
+        if (t.text == "union") { return "%u." + n.text }
+        return "%s." + n.text
+    }
+    if (t.text == "void") { return "void" }
+    if (t.text == "char") {
+        if (unsigned) { return "u8" }
+        return "i8"
+    }
+    if (t.text == "float") { return "f32" }
+    if (t.text == "double") { return "f64" }
+    if (t.text == "_Bool") { return "u8" }
+    if (t.text == "__builtin_va_list" || t.text == "__gnuc_va_list" || t.text == "va_list") { return "*i8" }
+    if (t.text == "FILE") { return "%s.__nanoc_FILE" }
+    if (t.text == "size_t" || t.text == "fpos_t" || t.text == "ptrdiff_t" || t.text == "ssize_t") { return "u64" }
+    if (t.text == "wchar_t") { return "i32" }
+    if (t.text == "__SIZE_TYPE__") { return "u64" }
+    if (t.text == "__PTRDIFF_TYPE__") { return "i64" }
+    if (t.text == "__WCHAR_TYPE__") { return "i32" }
+    if (t.text == "__WINT_TYPE__") { return "u32" }
+    if (t.text == "int8_t" || t.text == "int_least8_t" || t.text == "int_fast8_t") { return "i8" }
+    if (t.text == "uint8_t" || t.text == "uint_least8_t" || t.text == "uint_fast8_t") { return "u8" }
+    if (t.text == "int16_t" || t.text == "int_least16_t" || t.text == "int_fast16_t") { return "i16" }
+    if (t.text == "uint16_t" || t.text == "uint_least16_t" || t.text == "uint_fast16_t") { return "u16" }
+    if (t.text == "int32_t" || t.text == "int_least32_t" || t.text == "int_fast32_t") { return "i32" }
+    if (t.text == "uint32_t" || t.text == "uint_least32_t" || t.text == "uint_fast32_t") { return "u32" }
+    if (t.text == "int64_t" || t.text == "int_least64_t" || t.text == "int_fast64_t") { return "i64" }
+    if (t.text == "uint64_t" || t.text == "uint_least64_t" || t.text == "uint_fast64_t") { return "u64" }
+    if (t.text == "intptr_t" || t.text == "intmax_t") { return "i64" }
+    if (t.text == "uintptr_t" || t.text == "uintmax_t") { return "u64" }
+    if (t.text == "memory_order") { return "i32" }
+    if (t.text == "atomic_bool" || t.text == "atomic_char" || t.text == "atomic_schar") { return "i8" }
+    if (t.text == "atomic_uchar") { return "u8" }
+    if (t.text == "atomic_short") { return "i16" }
+    if (t.text == "atomic_ushort") { return "u16" }
+    if (t.text == "atomic_int" || t.text == "atomic_long" || t.text == "atomic_llong") { return "i32" }
+    if (t.text == "atomic_uint" || t.text == "atomic_ulong" || t.text == "atomic_ullong") { return "u32" }
+    if (t.text == "atomic_wchar_t") { return "i32" }
+    if (t.text == "_Atomic") {
+        if (C.isPunct("(") == false) { parseFail(C, "expected atomic type") }
+        C.take()
+        var atomicTy = parseBaseType(C)
+        if (C.isPunct(")") == false) { parseFail(C, "expected ')' after atomic type") }
+        C.take()
+        return atomicTy
+    }
+    if (t.text == "int") {
+        if (unsigned) { return "u32" }
+        return "i32"
+    }
+    parseFail(C, "unsupported type " + t.text)
+    return "i32"
+}
+
+class Decl {
+    var string name
+    var string ctype
+    var bool function
+    var array[string] params
+    var array[string] paramNames
+    var bool variadic
+
+    fun init(string name, string ctype) {
+        this.name = name
+        this.ctype = ctype
+        this.function = false
+        this.params = []
+        this.paramNames = []
+        this.variadic = false
+    }
+}
+
+fun parseDeclarator(view mut Cursor C, string base) -> Decl {
+    var ty = base
+    while (C.isPunct("*")) {
+        C.take()
+        ty = "*" + ty
+    }
+    if (C.isPunct("(")) {
+        C.take()
+        var inner = parseDeclarator(C, ty)
+        if (C.isPunct(")") == false) {
+            parseFail(C, "expected ')' in declarator")
+        }
+        C.take()
+        if (C.isPunct("(")) {
+            C.take()
+            var array[string] fparams = []
+            var array[string] fnames = []
+            var fvariadic = false
+            if (C.isPunct(")") == false) {
+                if (C.isWord("void") && C.i + 1 < arrays.length(C.toks)
+                    && arrays.at(C.toks, C.i + 1).text == ")") {
+                    C.take()
+                } else {
+                    while (true) {
+                        if (C.isPunct("...")) {
+                            C.take()
+                            fvariadic = true
+                            break
+                        }
+                        var fpt = parseBaseType(C)
+                        var fpd = parseDeclarator(C, fpt)
+                        var fty = copy(fpd.ctype)
+                        if (tyIsArray(fty)) { fty = "*" + elemTy(fty) }
+                        arrays.push(fparams, fty)
+                        arrays.push(fnames, copy(fpd.name))
+                        if (C.isPunct(",")) { C.take(); continue }
+                        break
+                    }
+                }
+            }
+            if (C.isPunct(")") == false) {
+                parseFail(C, "expected ')' after function pointer parameters")
+            }
+            C.take()
+            inner.function = false
+            var returnTy = pointee(inner.ctype)
+            inner.params = copy(fparams)
+            inner.paramNames = copy(fnames)
+            inner.variadic = fvariadic
+            inner.ctype = "*" + makeFunctionType(copy(fparams), fvariadic, copy(returnTy))
+        }
+        return inner
+    }
+    if (C.isPunct(",") || C.isPunct(")") || C.isPunct(":")) {
+        return Decl("", ty)
+    }
+    var nameTok = C.take()
+    if (nameTok.kind != "id") {
+        parseFail(C, "expected identifier in declarator")
+    }
+    var D = Decl(nameTok.text, copy(ty))
+    if (C.isPunct("(") ) {
+        D.function = true
+        C.take()
+        if (C.isPunct(")") == false) {
+            if (C.isWord("void") && C.i + 1 < arrays.length(C.toks)
+                && arrays.at(C.toks, C.i + 1).text == ")") {
+                C.take()
+            } else {
+            while (true) {
+                if (C.isPunct("...")) {
+                    C.take()
+                    D.variadic = true
+                    break
+                }
+                var pt = parseBaseType(C)
+                var pd = parseDeclarator(C, pt)
+                var paramTy = copy(pd.ctype)
+                if (tyIsArray(paramTy)) {
+                    paramTy = "*" + elemTy(paramTy)
+                }
+                arrays.push(D.params, paramTy)
+                arrays.push(D.paramNames, copy(pd.name))
+                if (C.isPunct(",")) {
+                    C.take()
+                    continue
+                }
+                break
+            }
+            }
+        }
+        if (C.isPunct(")") == false) {
+            parseFail(C, "expected ')' after parameter list")
+        }
+        C.take()
+        var sigRet = copy(D.ctype)
+        var sig = makeFunctionType(copy(D.params), D.variadic, copy(sigRet))
+        D.ctype = sig
+    }
+    while (C.isPunct("[")) {
+        C.take()
+        var n = C.take()
+        if (n.kind != "num") {
+            parseFail(C, "array bound must be an integer constant")
+        }
+        if (C.isPunct("]") == false) {
+            parseFail(C, "expected ']' after array bound")
+        }
+        C.take()
+        D.ctype = "[" + n.text + " x " + D.ctype + "]"
+    }
+    return D
+}
+
+fun joinTypes(view array[string] types) -> string {
+    var s = ""
+    var i = 0
+    while (i < arrays.length(types)) {
+        if (i > 0) { s = s + "," }
+        s = s + arrays.at(types, i)
+        i = i + 1
+    }
+    return s
+}
+
+fun makeFunctionType(view array[string] params, bool variadic, view string ret) -> string {
+    var inside = joinTypes(params)
+    if (variadic) {
+        if (inside != "") { inside = inside + "," }
+        inside = inside + "..."
+    }
+    return "fn(" + inside + ")->" + copy(ret)
+}
+
+fun skipInitializer(view mut Cursor C) {
+    var paren = 0
+    var bracket = 0
+    var brace = 0
+    while (C.atEnd() == false) {
+        var t = C.peek()
+        if (t.kind == "pn" && t.text == "(") { paren = paren + 1 }
+        if (t.kind == "pn" && t.text == ")") {
+            if (paren == 0) { break }
+            paren = paren - 1
+        }
+        if (t.kind == "pn" && t.text == "[") { bracket = bracket + 1 }
+        if (t.kind == "pn" && t.text == "]") {
+            if (bracket == 0) { break }
+            bracket = bracket - 1
+        }
+        if (t.kind == "pn" && t.text == "{") { brace = brace + 1 }
+        if (t.kind == "pn" && t.text == "}") {
+            if (brace == 0) { break }
+            brace = brace - 1
+        }
+        if (paren == 0 && bracket == 0 && brace == 0 && t.text == ";") {
+            break
+        }
+        C.take()
+    }
+}
+
+fun parseStructDefinition(view mut Compiler C, view mut Cursor P) -> int {
+    P.take()
+    var name = P.take()
+    if (name.kind != "id") {
+        parseFail(P, "expected struct tag")
+    }
+    var S = StructInfo(name.text)
+    if (P.isPunct("{") == false) {
+        // A reference type is enough here; a definition can appear later.
+        return 0
+    }
+    P.take()
+    while (P.atEnd() == false && P.isPunct("}") == false) {
+        var ft = parseBaseType(P)
+        var fd = parseDeclarator(P, ft)
+        var bits = 0
+        if (P.isPunct(":")) {
+            P.take()
+            var width = P.take()
+            if (width.kind != "num") { parseFail(P, "bitfield width must be an integer") }
+            bits = width.ival
+        }
+        arrays.push(S.fieldNames, copy(fd.name))
+        arrays.push(S.fieldTypes, copy(fd.ctype))
+        arrays.push(S.fieldBits, bits)
+        arrays.push(S.fieldBitOffsets, 0)
+        if (P.isPunct(";")) {
+            P.take()
+        } else {
+            parseFail(P, "expected ';' after struct field")
+        }
+    }
+    if (P.isPunct("}")) { P.take() }
+    var i = 0
+    var off = 0
+    var al = 1
+    var bitCursor = 0
+    while (i < arrays.length(S.fieldTypes)) {
+        var ft2 = arrays.at(S.fieldTypes, i)
+        var bits2 = arrays.at(S.fieldBits, i)
+        if (bits2 > 0) {
+            if (bitCursor == 0) {
+                off = alignUp(off, 4)
+                off = off + 4
+            }
+            S.fieldBitOffsets[i] = bitCursor
+            bitCursor = bitCursor + bits2
+            if (bitCursor >= 32) { bitCursor = 0 }
+            al = maxInt(al, 4)
+        } else {
+            bitCursor = 0
+            var fa = tyAlign(C, ft2)
+            off = alignUp(off, fa)
+            off = off + tySize(C, ft2)
+            al = maxInt(al, fa)
+        }
+        i = i + 1
+    }
+    S.align = al
+    S.size = alignUp(off, al)
+    arrays.push(C.structs, copy(S))
+    return 0
+}
+
+fun parseUnionDefinition(view mut Compiler C, view mut Cursor P) -> int {
+    P.take()
+    var name = P.take()
+    if (name.kind != "id") { parseFail(P, "expected union tag") }
+    var U = StructInfo(name.text)
+    U.isUnion = true
+    expectPunct(P, "{")
+    while (P.atEnd() == false && P.isPunct("}") == false) {
+        var ft = parseBaseType(P)
+        var fd = parseDeclarator(P, ft)
+        var bits = 0
+        if (P.isPunct(":")) {
+            P.take()
+            var width = P.take()
+            if (width.kind != "num") { parseFail(P, "bitfield width must be an integer") }
+            bits = width.ival
+        }
+        arrays.push(U.fieldNames, copy(fd.name))
+        arrays.push(U.fieldTypes, copy(fd.ctype))
+        arrays.push(U.fieldBits, bits)
+        arrays.push(U.fieldBitOffsets, 0)
+        expectPunct(P, ";")
+    }
+    expectPunct(P, "}")
+    var i = 0
+    var size = 0
+    var al = 1
+    while (i < arrays.length(U.fieldTypes)) {
+        var ft2 = arrays.at(U.fieldTypes, i)
+        size = maxInt(size, tySize(C, ft2))
+        al = maxInt(al, tyAlign(C, ft2))
+        i = i + 1
+    }
+    U.align = al
+    U.size = alignUp(size, al)
+    arrays.push(C.structs, copy(U))
+    return 0
+}
+
+fun parseExternal(view mut Compiler C, view mut Cursor P) -> int {
+    if (P.isWord("typedef") && P.i + 1 < arrays.length(P.toks)
+        && arrays.at(P.toks, P.i + 1).text == "enum") {
+        P.take()
+        P.take()
+        if (P.peek().kind == "id" && P.i + 1 < arrays.length(P.toks)
+            && arrays.at(P.toks, P.i + 1).text == "{") {
+            P.take()
+        }
+        expectPunct(P, "{")
+        var enumValue = 0
+        while (P.atEnd() == false && P.isPunct("}") == false) {
+            var enumName = P.take()
+            if (enumName.kind != "id") { parseFail(P, "expected enumerator") }
+            if (P.isPunct("=")) {
+                P.take()
+                var explicitValue = P.take()
+                if (explicitValue.kind != "num") { parseFail(P, "enumerator value must be an integer") }
+                enumValue = explicitValue.ival
+            }
+            arrays.push(C.constNames, copy(enumName.text))
+            arrays.push(C.constValues, enumValue)
+            if (P.isPunct(",")) { P.take() }
+            enumValue = enumValue + 1
+        }
+        expectPunct(P, "}")
+        var enumAlias = P.take()
+        if (enumAlias.kind != "id") { parseFail(P, "expected enum typedef name") }
+        arrays.push(C.typedefNames, copy(enumAlias.text))
+        arrays.push(C.typedefTypes, "i32")
+        if (P.isPunct(";")) { P.take() }
+        return 0
+    }
+    if (P.isWord("enum")) {
+        P.take()
+        if (P.peek().kind == "id") { P.take() }
+        if (P.isPunct("{")) {
+            P.take()
+            while (P.atEnd() == false && P.isPunct("}") == false) {
+                P.take()
+                if (P.isPunct("=")) { P.take(); P.take() }
+                if (P.isPunct(",")) { P.take() }
+            }
+            if (P.isPunct("}")) { P.take() }
+            if (P.isPunct(";")) { P.take() }
+            return 0
+        }
+    }
+    if (P.isWord("struct")) {
+        // Parse a definition in place; a trailing declarator is handled by
+        // the ordinary declaration path after the closing brace.
+        var save = P.i
+        P.take()
+        P.take()
+        if (P.isPunct("{")) {
+            P.i = save
+            parseStructDefinition(C, P)
+            if (P.isPunct(";")) { P.take(); return 0 }
+        } else {
+            P.i = save
+        }
+    }
+    if (P.isWord("union")) {
+        var usave = P.i
+        P.take()
+        P.take()
+        if (P.isPunct("{")) {
+            P.i = usave
+            parseUnionDefinition(C, P)
+            if (P.isPunct(";")) { P.take(); return 0 }
+        } else {
+            P.i = usave
+        }
+    }
+    var typedef = false
+    if (P.isWord("typedef")) {
+        P.take()
+        typedef = true
+    }
+    while (P.isWord("static") || P.isWord("extern")) {
+        P.take()
+    }
+    if (isCompilerType(P, C) == false) {
+        parseFail(P, "expected declaration")
+    }
+    var base = parseCompilerBaseType(P, C)
+    while (true) {
+        var D = parseDeclarator(P, copy(base))
+        var S = Symbol(D.name, D.ctype, P.peek().line)
+        S.function = D.function
+        S.typedef = typedef
+        S.params = copy(D.params)
+        compilerAdd(C, S)
+        if (typedef) {
+            arrays.push(C.typedefNames, copy(D.name))
+            arrays.push(C.typedefTypes, copy(D.ctype))
+        }
+        if (D.function && P.isPunct("{") ) {
+            skipBlock(P)
+            return 0
+        } else if (P.isPunct("=")) {
+            P.take()
+            skipInitializer(P)
+        }
+        if (P.isPunct(",")) {
+            P.take()
+            continue
+        }
+        if (P.isPunct(";")) {
+            P.take()
+            return 0
+        }
+        if (D.function && P.isPunct("}")) {
+            return 0
+        }
+        parseFail(P, "expected ';' after declaration")
+    }
+}
+
+fun skipBlock(view mut Cursor P) -> int {
+    if (P.isPunct("{") == false) {
+        parseFail(P, "expected function body")
+    }
+    var depth = 0
+    while (P.atEnd() == false) {
+        var t = P.take()
+        if (t.kind == "pn" && t.text == "{") { depth = depth + 1 }
+        if (t.kind == "pn" && t.text == "}") {
+            depth = depth - 1
+            if (depth == 0) { return 0 }
+        }
+    }
+    parseFail(P, "unterminated function body")
+    return 0
+}
+
+fun parseTranslationUnit(view mut Compiler C, view array[Token] toks) -> int {
+    // Cursor consumers are allowed to move token fields.  Parse an owned
+    // deep copy so the original stream remains available to -E output.
+    var P = Cursor(copyTokens(toks))
+    while (P.atEnd() == false) {
+        parseExternal(C, P)
+        C.parsed = C.parsed + 1
+    }
+    return C.parsed
+}

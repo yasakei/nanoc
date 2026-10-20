@@ -1,0 +1,199 @@
+// Canonical type encodings shared by every pass.
+//   "i8" "i16" "i32" "i64"  signed ints
+//   "u8" "u16" "u32" "u64"  unsigned ints
+//   "f32" "f64"             C float / double
+//   "void"
+//   "*T"                    pointer to T
+//   "[N x T]"               array
+//   "%st.Name"              named struct type
+use strings
+use arrays
+use fmt
+
+class StructInfo {
+    var string name
+    var bool isUnion
+    var array[string] fieldNames
+    var array[string] fieldTypes
+    var array[int] fieldBits
+    var array[int] fieldBitOffsets
+    var int size
+    var int align
+
+    fun init(string name) {
+        this.name = name
+        this.isUnion = false
+        this.fieldNames = []
+        this.fieldTypes = []
+        this.fieldBits = []
+        this.fieldBitOffsets = []
+        this.size = 0
+        this.align = 1
+    }
+}
+
+class Symbol {
+    var string name
+    var string ctype
+    var int line
+    var bool function
+    var bool typedef
+    var array[string] params
+
+    fun init(string name, string ctype, int line) {
+        this.name = name
+        this.ctype = ctype
+        this.line = line
+        this.function = false
+        this.typedef = false
+        this.params = []
+    }
+}
+
+class Compiler {
+    var array[StructInfo] structs
+    var array[Symbol] globals
+    var array[string] typedefNames
+    var array[string] typedefTypes
+    var array[string] constNames
+    var array[int] constValues
+    var int parsed
+
+    fun init() {
+        this.structs = []
+        this.globals = []
+        this.typedefNames = []
+        this.typedefTypes = []
+        this.constNames = []
+        this.constValues = []
+        this.parsed = 0
+    }
+}
+
+fun structInfoOf(view Compiler C, view string name) -> StructInfo {
+    var i = 0
+    while (i < arrays.length(C.structs)) {
+        var S = arrays.at(C.structs, i)
+        if (S.name == name) {
+            return copy(S)
+        }
+        i = i + 1
+    }
+    throw "unknown struct type " + copy(name)
+}
+
+fun tyIsUnsigned(view string t) -> bool {
+    return t == "u8" || t == "u16" || t == "u32" || t == "u64"
+}
+
+fun tyIsFloat(view string t) -> bool {
+    return t == "f32" || t == "f64"
+}
+
+fun tyIsPointer(view string t) -> bool {
+    var n = strings.length(copy(t))
+    return n > 1 && strings.substring(copy(t), 0, 1) == "*"
+}
+
+fun tyIsFunction(view string t) -> bool {
+    return strings.substring(copy(t), 0, 3) == "fn("
+}
+
+fun tyIsFunctionPointer(view string t) -> bool {
+    return tyIsPointer(t) && tyIsFunction(pointee(t))
+}
+
+fun tyIsArray(view string t) -> bool {
+    return strings.substring(copy(t), 0, 1) == "["
+}
+
+fun tyIsStruct(view string t) -> bool {
+    if (tyIsPointer(t)) {
+        return tyIsStruct(pointee(t))
+    }
+    return strings.substring(copy(t), 0, 2) == "%s"
+}
+
+fun tyIsUnion(view string t) -> bool {
+    if (tyIsPointer(t)) { return tyIsUnion(pointee(t)) }
+    return strings.substring(copy(t), 0, 2) == "%u"
+}
+
+fun tyIsInt(view string t) -> bool {
+    if (tyIsFloat(t) == false && tyIsPointer(t) == false && t != "void"
+        && tyIsArray(t) == false && tyIsStruct(t) == false && tyIsUnion(t) == false) {
+        return true
+    }
+    return false
+}
+
+fun pointee(view string t) -> string {
+    return strings.substring(copy(t), 1, strings.length(copy(t)))
+}
+
+// LLVM textual type for a value of this encoding.
+fun llvmT(view string t) -> string {
+    if (tyIsPointer(t)) { return "ptr" }
+    if (t == "f32") { return "float" }
+    if (t == "f64") { return "double" }
+    return copy(t)
+}
+
+// "[N x T]" -> N
+fun arrLen(view string t) -> int {
+    var i = strings.index_of(copy(t), " x ", 1)
+    if (i <= 0) {
+        return fmt.to_int(strings.substring(copy(t), 1, strings.index_of(copy(t), "]", 1)))
+    }
+    return fmt.to_int(strings.substring(copy(t), 1, i))
+}
+
+// "[N x T]" -> T
+fun elemTy(view string t) -> string {
+    var i = strings.index_of(copy(t), " x ", 1)
+    if (i <= 0) {
+        i = strings.index_of(copy(t), "]", 1)
+        return strings.substring(copy(t), 1, i)
+    }
+    return strings.substring(copy(t), i + 3, strings.length(copy(t)) - 1)
+}
+
+fun tySize(view Compiler C, view string t) -> int {
+    if (t == "i8" || t == "u8") { return 1 }
+    if (t == "i16" || t == "u16") { return 2 }
+    if (t == "i32" || t == "u32" || t == "f32") { return 4 }
+    if (t == "i64" || t == "u64" || t == "f64") { return 8 }
+    if (tyIsPointer(t)) { return 8 }
+    if (t == "void") { return 1 }
+    if (tyIsArray(t)) { return arrLen(t) * tySize(C, elemTy(t)) }
+    if (tyIsStruct(t) || tyIsUnion(t)) {
+        var S = structInfoOf(C, strings.substring(copy(t), 3, strings.length(copy(t))))
+        return S.size
+    }
+    return 0
+}
+
+fun tyAlign(view Compiler C, view string t) -> int {
+    if (t == "i8" || t == "u8") { return 1 }
+    if (t == "i16" || t == "u16") { return 2 }
+    if (t == "i32" || t == "u32" || t == "f32") { return 4 }
+    if (t == "i64" || t == "u64" || t == "f64" || tyIsPointer(t)) { return 8 }
+    if (tyIsArray(t)) { return tyAlign(C, elemTy(t)) }
+    if (tyIsStruct(t) || tyIsUnion(t)) {
+        var S = structInfoOf(C, strings.substring(copy(t), 3, strings.length(copy(t))))
+        return S.align
+    }
+    return 1
+}
+
+fun maxInt(int a, int b) -> int {
+    if (a > b) { return a }
+    return b
+}
+
+fun alignUp(int v, int a) -> int {
+    if (a <= 1) { return v }
+    var r = v % a
+    if (r == 0) { return v }
+    return v + a - r
+}

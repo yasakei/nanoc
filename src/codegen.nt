@@ -1,0 +1,1875 @@
+// Small, deliberately low-level x86-64 backend.
+//
+// Parse declarations, lower expressions directly to machine instructions, and
+// keep a small symbol table for locals and globals.  The backend is intentionally
+// compact and grows in focused, testable slices.
+use strings
+use arrays
+use fmt
+use "parse.nt"
+
+class Asm {
+    var array[string] lines
+    var int stringId
+
+    fun init() {
+        this.lines = []
+        this.stringId = 0
+    }
+
+    fun line(string s) {
+        arrays.push(this.lines, copy(s))
+    }
+
+    fun text() -> string {
+        var out = ""
+        var i = 0
+        while (i < arrays.length(this.lines)) {
+            out = out + copy(arrays.at(this.lines, i)) + "\n"
+            i = i + 1
+        }
+        return out
+    }
+
+    fun stringLiteral(string body) -> string {
+        var id = this.stringId
+        this.stringId = this.stringId + 1
+        var label = ".LC" + ("" + id)
+        this.line(".section .rodata")
+        this.line(label + ":")
+        this.line(".string \"" + copy(body) + "\"")
+        this.line(".text")
+        return label
+    }
+
+    fun floatLiteral(string body) -> string {
+        var id = this.stringId
+        this.stringId = this.stringId + 1
+        var label = ".LF" + ("" + id)
+        this.line(".section .rodata")
+        this.line(label + ":")
+        this.line(".double " + copy(body))
+        this.line(".text")
+        return label
+    }
+}
+
+class FnGen {
+    var string name
+    var string retType
+    var array[string] locals
+    var array[string] localTypes
+    var array[int] offsets
+    var int nextOffset
+    var int label
+    var bool returned
+    var array[string] breakLabels
+    var array[string] continueLabels
+    var array[StructInfo] structs
+    var array[string] globalNames
+    var array[string] globalTypes
+    var array[string] typedefNames
+    var array[string] typedefTypes
+    var array[string] constNames
+    var array[int] constValues
+    var string lastField
+    var string lastFieldBase
+    var bool variadic
+    var int namedParams
+
+    fun init(string name) {
+        this.name = name
+        this.retType = "i32"
+        this.locals = []
+        this.localTypes = []
+        this.offsets = []
+        this.nextOffset = 4
+        this.label = 0
+        this.returned = false
+        this.breakLabels = []
+        this.continueLabels = []
+        this.structs = []
+        this.globalNames = []
+        this.globalTypes = []
+        this.typedefNames = []
+        this.typedefTypes = []
+        this.constNames = []
+        this.constValues = []
+        this.lastField = ""
+        this.lastFieldBase = ""
+        this.variadic = false
+        this.namedParams = 0
+    }
+}
+
+fun fnLocal(view FnGen F, view string name) -> int {
+    var i = arrays.length(F.locals) - 1
+    while (i >= 0) {
+        if (arrays.at(F.locals, i) == name) {
+            return arrays.at(F.offsets, i)
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+fun fnAddLocal(view mut FnGen F, view string name) -> int {
+    return fnAddLocalType(F, name, "i32")
+}
+
+fun backendTypeSize(view string ty) -> int {
+    if (ty == "i8" || ty == "u8") { return 1 }
+    if (ty == "i16" || ty == "u16") { return 2 }
+    if (ty == "f64") { return 8 }
+    if (ty == "f32") { return 4 }
+    if (ty == "i64" || ty == "u64" || tyIsPointer(ty)) { return 8 }
+    if (tyIsArray(ty)) { return arrLen(ty) * backendTypeSize(elemTy(ty)) }
+    return 4
+}
+
+fun integerIsUnsigned(view string ty) -> bool {
+    return ty == "u8" || ty == "u16" || ty == "u32" || ty == "u64"
+}
+
+fun emitIntegerCast(view mut Asm A, view string ty) {
+    if (ty == "i8") { A.line("movsbl %al, %eax") }
+    if (ty == "u8") { A.line("movzbl %al, %eax") }
+    if (ty == "i16") { A.line("movswl %ax, %eax") }
+    if (ty == "u16") { A.line("movzwl %ax, %eax") }
+    if (ty == "i64") { A.line("cltq") }
+    if (ty == "u64") { A.line("movl %eax, %eax") }
+}
+
+fun fnStruct(view FnGen F, view string ty) -> StructInfo {
+    var name = copy(ty)
+    if (tyIsPointer(name)) { name = pointee(name) }
+    name = strings.substring(name, 3, strings.length(name))
+    var i = 0
+    while (i < arrays.length(F.structs)) {
+        var S = arrays.at(F.structs, i)
+        if (S.name == name) { return copy(S) }
+        i = i + 1
+    }
+    throw "unknown struct type " + name
+}
+
+fun fnTypeSize(view FnGen F, view string ty) -> int {
+    if (tyIsStruct(ty) || tyIsUnion(ty)) { return fnStruct(F, ty).size }
+    if (tyIsArray(ty)) { return arrLen(ty) * fnTypeSize(F, elemTy(ty)) }
+    return backendTypeSize(ty)
+}
+
+fun fnFieldOffset(view FnGen F, view string ty, view string field) -> int {
+    var S = fnStruct(F, ty)
+    var i = 0
+    var off = 0
+    while (i < arrays.length(S.fieldNames)) {
+        var ft = arrays.at(S.fieldTypes, i)
+        if (S.isUnion == false) { off = alignUp(off, tyAlignFromBackend(F, ft)) }
+        if (arrays.at(S.fieldNames, i) == field) { return off }
+        if (S.isUnion == false) { off = off + fnTypeSize(F, ft) }
+        i = i + 1
+    }
+    return -1
+}
+
+fun tyAlignFromBackend(view FnGen F, view string ty) -> int {
+    if (tyIsStruct(ty) || tyIsUnion(ty)) { return fnStruct(F, ty).align }
+    if (tyIsArray(ty)) { return tyAlignFromBackend(F, elemTy(ty)) }
+    if (tyIsPointer(ty) || ty == "i64" || ty == "u64" || ty == "f64") { return 8 }
+    if (ty == "i8" || ty == "u8") { return 1 }
+    if (ty == "i16" || ty == "u16") { return 2 }
+    return 4
+}
+
+fun fnFieldType(view FnGen F, view string ty, view string field) -> string {
+    var S = fnStruct(F, ty)
+    var i = 0
+    while (i < arrays.length(S.fieldNames)) {
+        if (arrays.at(S.fieldNames, i) == field) {
+            return copy(arrays.at(S.fieldTypes, i))
+        }
+        i = i + 1
+    }
+    return "i32"
+}
+
+fun fnFieldBits(view FnGen F, view string ty, view string field) -> int {
+    if (ty == "" || field == "") { return 0 }
+    var S = fnStruct(F, ty)
+    var i = 0
+    while (i < arrays.length(S.fieldNames)) {
+        if (arrays.at(S.fieldNames, i) == field) { return arrays.at(S.fieldBits, i) }
+        i = i + 1
+    }
+    return 0
+}
+
+fun fnFieldBitOffset(view FnGen F, view string ty, view string field) -> int {
+    if (ty == "" || field == "") { return 0 }
+    var S = fnStruct(F, ty)
+    var i = 0
+    while (i < arrays.length(S.fieldNames)) {
+        if (arrays.at(S.fieldNames, i) == field) { return arrays.at(S.fieldBitOffsets, i) }
+        i = i + 1
+    }
+    return 0
+}
+
+fun fnType(view FnGen F, view string name) -> string {
+    var i = 0
+    while (i < arrays.length(F.locals)) {
+        if (arrays.at(F.locals, i) == name) {
+            return copy(arrays.at(F.localTypes, i))
+        }
+        i = i + 1
+    }
+    return "i32"
+}
+
+fun fnGlobalType(view FnGen F, view string name) -> string {
+    var i = 0
+    while (i < arrays.length(F.globalNames)) {
+        if (arrays.at(F.globalNames, i) == name) {
+            return copy(arrays.at(F.globalTypes, i))
+        }
+        i = i + 1
+    }
+    return "i32"
+}
+
+fun fnTypedef(view FnGen F, view string name) -> string {
+    var i = arrays.length(F.typedefNames) - 1
+    while (i >= 0) {
+        if (arrays.at(F.typedefNames, i) == name) {
+            return copy(arrays.at(F.typedefTypes, i))
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fun fnConst(view FnGen F, view string name) -> int {
+    var i = 0
+    while (i < arrays.length(F.constNames)) {
+        if (arrays.at(F.constNames, i) == name) { return arrays.at(F.constValues, i) }
+        i = i + 1
+    }
+    return -2147483648
+}
+
+fun fnIsType(view FnGen F, view mut Cursor P) -> bool {
+    if (isTypeWord(P)) { return true }
+    if (P.i >= arrays.length(P.toks)) { return false }
+    var t = arrays.at(P.toks, P.i)
+    return t.kind == "id" && fnTypedef(F, t.text) != ""
+}
+
+fun fnParseBase(view FnGen F, view mut Cursor P) -> string {
+    var t = arrays.at(P.toks, P.i)
+    if (t.kind == "id") {
+        var alias = fnTypedef(F, t.text)
+        if (alias != "") {
+            P.take()
+            return alias
+        }
+    }
+    return parseBaseType(P)
+}
+
+fun functionParamType(view FnGen F, view string name, int index) -> string {
+    var sig = fnGlobalType(F, name)
+    if (fnLocal(F, name) != 0) { sig = fnType(F, name) }
+    if (tyIsFunctionPointer(sig)) { sig = pointee(sig) }
+    var open = strings.index_of(copy(sig), "fn(", 0)
+    var closeAt = strings.index_of(copy(sig), ")->", 1)
+    if (open < 0 || closeAt < 0 || index < 0) { return "i32" }
+    var inside = strings.substring(copy(sig), open + 3, closeAt)
+    var start = 0
+    var i = 0
+    while (i < index) {
+        var comma = strings.index_of(copy(inside), ",", start)
+        if (comma < 0) { return "i32" }
+        start = comma + 1
+        i = i + 1
+    }
+    var comma2 = strings.index_of(copy(inside), ",", start)
+    if (comma2 < 0) { comma2 = strings.length(inside) }
+    return strings.substring(copy(inside), start, comma2)
+}
+
+fun fnAddLocalType(view mut FnGen F, view string name, view string ty) -> int {
+    var rawSize = fnTypeSize(F, ty)
+    var size = rawSize
+    if (size < 4) { size = 4 }
+    var off = F.nextOffset
+    if (tyIsArray(ty)) {
+        var elemSize = fnTypeSize(F, elemTy(ty))
+        F.nextOffset = off + rawSize - elemSize + 4
+    } else {
+        if (size >= 8) {
+            off = alignUp(F.nextOffset + size - 4, 8)
+        }
+        F.nextOffset = off + 4
+    }
+    arrays.push(F.locals, copy(name))
+    arrays.push(F.localTypes, copy(ty))
+    arrays.push(F.offsets, off)
+    return off
+}
+
+fun fnLabel(view mut FnGen F) -> string {
+    var n = F.label
+    F.label = F.label + 1
+    return ".L" + F.name + "." + ("" + n)
+}
+
+fun asmReg(int index) -> string {
+    if (index == 0) { return "%edi" }
+    if (index == 1) { return "%esi" }
+    if (index == 2) { return "%edx" }
+    if (index == 3) { return "%ecx" }
+    if (index == 4) { return "%r8d" }
+    if (index == 5) { return "%r9d" }
+    return ""
+}
+
+fun asmByteReg(int index) -> string {
+    if (index == 0) { return "%dil" }
+    if (index == 1) { return "%sil" }
+    if (index == 2) { return "%dl" }
+    if (index == 3) { return "%cl" }
+    if (index == 4) { return "%r8b" }
+    if (index == 5) { return "%r9b" }
+    return ""
+}
+
+fun asmWordReg(int index) -> string {
+    if (index == 0) { return "%di" }
+    if (index == 1) { return "%si" }
+    if (index == 2) { return "%dx" }
+    if (index == 3) { return "%cx" }
+    if (index == 4) { return "%r8w" }
+    if (index == 5) { return "%r9w" }
+    return ""
+}
+
+fun asmPopReg(int index) -> string {
+    if (index == 0) { return "%rdi" }
+    if (index == 1) { return "%rsi" }
+    if (index == 2) { return "%rdx" }
+    if (index == 3) { return "%rcx" }
+    if (index == 4) { return "%r8" }
+    if (index == 5) { return "%r9" }
+    return ""
+}
+
+fun asmXmm(int index) -> string {
+    return "%xmm" + ("" + index)
+}
+
+fun functionReturnType(view string sig) -> string {
+    var p = strings.index_of(copy(sig), ")->", 1)
+    if (p < 0) { return "i32" }
+    return strings.substring(copy(sig), p + 3, strings.length(copy(sig)))
+}
+
+fun functionIsVariadic(view string sig) -> bool {
+    return strings.index_of(copy(sig), "...", 0) >= 0
+}
+
+fun asmOpPrec(string op) -> int {
+    if (op == "||") { return 1 }
+    if (op == "&&") { return 2 }
+    if (op == "|") { return 3 }
+    if (op == "^") { return 4 }
+    if (op == "&") { return 5 }
+    if (op == "==" || op == "!=") { return 6 }
+    if (op == "<" || op == ">" || op == "<=" || op == ">=") { return 7 }
+    if (op == "<<" || op == ">>") { return 8 }
+    if (op == "+" || op == "-") { return 9 }
+    if (op == "*" || op == "/" || op == "%") { return 10 }
+    return 0
+}
+
+fun isBinary(view Token t) -> bool {
+    return t.kind == "pn" && asmOpPrec(t.text) > 0
+}
+
+fun emitShortCircuit(view mut Asm A, view mut FnGen F, view mut Cursor P, view string op, int prec) -> int {
+    var trueLabel = fnLabel(F)
+    var falseLabel = fnLabel(F)
+    var doneLabel = fnLabel(F)
+    A.line("cmpl $0, %eax")
+    if (op == "&&") { A.line("je " + falseLabel) } else { A.line("jne " + trueLabel) }
+    emitExpr(A, F, P, prec + 1)
+    A.line("cmpl $0, %eax")
+    if (op == "&&") { A.line("je " + falseLabel) } else { A.line("jne " + trueLabel) }
+    if (op == "&&") {
+        A.line("movl $1, %eax")
+        A.line("jmp " + doneLabel)
+        A.line(falseLabel + ":")
+        A.line("movl $0, %eax")
+    } else {
+        A.line("movl $0, %eax")
+        A.line("jmp " + doneLabel)
+        A.line(trueLabel + ":")
+        A.line("movl $1, %eax")
+    }
+    A.line(doneLabel + ":")
+    return 0
+}
+
+fun beginsFloat(view FnGen F, view Cursor P) -> bool {
+    var t = P.peek()
+    if (t.kind == "flo") { return true }
+    if (t.kind == "id" && tyIsFloat(fnType(F, t.text))) { return true }
+    if (t.kind == "id" && P.i + 1 < arrays.length(P.toks)
+        && arrays.at(P.toks, P.i + 1).kind == "pn"
+        && arrays.at(P.toks, P.i + 1).text == "(") {
+        if (tyIsFloat(functionReturnType(fnGlobalType(F, t.text)))) { return true }
+    }
+    if (t.kind == "pn" && t.text == "(" && P.i + 1 < arrays.length(P.toks)) {
+        var n = arrays.at(P.toks, P.i + 1)
+        if (n.kind == "flo") { return true }
+        if (n.kind == "id" && tyIsFloat(fnType(F, n.text))) { return true }
+    }
+    return false
+}
+
+fun emitLoad(view mut Asm A, view FnGen F, view string name) {
+    var off = fnLocal(F, name)
+    var ty = fnType(F, name)
+    if (off != 0) {
+        if (tyIsFloat(ty)) {
+            A.line("movsd -" + ("" + off) + "(%rbp), %xmm0")
+        } else if (tyIsPointer(ty)) {
+            A.line("movq -" + ("" + off) + "(%rbp), %rax")
+        } else if (ty == "i64" || ty == "u64") {
+            A.line("movq -" + ("" + off) + "(%rbp), %rax")
+        } else if (ty == "i8" || ty == "u8") {
+            if (ty == "i8") {
+                A.line("movsbl -" + ("" + off) + "(%rbp), %eax")
+            } else {
+                A.line("movzbl -" + ("" + off) + "(%rbp), %eax")
+            }
+        } else if (ty == "i16" || ty == "u16") {
+            if (ty == "i16") {
+                A.line("movswl -" + ("" + off) + "(%rbp), %eax")
+            } else {
+                A.line("movzwl -" + ("" + off) + "(%rbp), %eax")
+            }
+        } else {
+            A.line("movl -" + ("" + off) + "(%rbp), %eax")
+        }
+    } else {
+        var gty = fnGlobalType(F, name)
+        if (tyIsFunction(gty)) {
+            A.line("leaq " + copy(name) + "(%rip), %rax")
+        } else if (tyIsPointer(gty) || gty == "i64" || gty == "u64") {
+            A.line("movq " + copy(name) + "(%rip), %rax")
+        } else if (tyIsFloat(gty)) {
+            A.line("movsd " + copy(name) + "(%rip), %xmm0")
+        } else if (gty == "i8") {
+            A.line("movsbl " + copy(name) + "(%rip), %eax")
+        } else if (gty == "u8") {
+            A.line("movzbl " + copy(name) + "(%rip), %eax")
+        } else if (gty == "i16") {
+            A.line("movswl " + copy(name) + "(%rip), %eax")
+        } else if (gty == "u16") {
+            A.line("movzwl " + copy(name) + "(%rip), %eax")
+        } else {
+            A.line("movl " + copy(name) + "(%rip), %eax")
+        }
+    }
+}
+
+fun emitStore(view mut Asm A, view FnGen F, view string name) {
+    var off = fnLocal(F, name)
+    var ty = fnType(F, name)
+    if (off == 0) {
+        var gty = fnGlobalType(F, name)
+        if (tyIsPointer(gty) || gty == "i64" || gty == "u64") {
+            A.line("movq %rax, " + copy(name) + "(%rip)")
+        } else if (tyIsFloat(gty)) {
+            A.line("movsd %xmm0, " + copy(name) + "(%rip)")
+        } else if (gty == "i8" || gty == "u8") {
+            A.line("movb %al, " + copy(name) + "(%rip)")
+        } else if (gty == "i16" || gty == "u16") {
+            A.line("movw %ax, " + copy(name) + "(%rip)")
+        } else {
+            A.line("movl %eax, " + copy(name) + "(%rip)")
+        }
+    } else if (tyIsFloat(ty)) {
+        A.line("movsd %xmm0, -" + ("" + off) + "(%rbp)")
+    } else if (tyIsPointer(ty) || ty == "i64" || ty == "u64") {
+        A.line("movq %rax, -" + ("" + off) + "(%rbp)")
+        } else if (ty == "i8" || ty == "u8") {
+            A.line("movb %al, -" + ("" + off) + "(%rbp)")
+        } else if (ty == "i16" || ty == "u16") {
+            A.line("movw %ax, -" + ("" + off) + "(%rbp)")
+        } else {
+            A.line("movl %eax, -" + ("" + off) + "(%rbp)")
+    }
+}
+
+fun emitAddressName(view mut Asm A, view FnGen F, view string name) {
+    var off = fnLocal(F, name)
+    if (off != 0) {
+        var ty = fnType(F, name)
+        if (tyIsArray(ty)) {
+            var baseOff = off + fnTypeSize(F, ty) - fnTypeSize(F, elemTy(ty))
+            A.line("leaq -" + ("" + baseOff) + "(%rbp), %rax")
+        } else {
+            A.line("leaq -" + ("" + off) + "(%rbp), %rax")
+        }
+    } else {
+        A.line("leaq " + copy(name) + "(%rip), %rax")
+    }
+}
+
+fun emitIndexAddress(view mut Asm A, view mut FnGen F, view mut Cursor P, view string name) {
+    var baseTy = fnType(F, name)
+    if (tyIsPointer(baseTy)) {
+        emitLoad(A, F, name)
+    } else {
+        emitAddressName(A, F, name)
+    }
+    P.take()
+    A.line("pushq %rax")
+    emitExpr(A, F, P, 1)
+    A.line("movl %eax, %ecx")
+    A.line("popq %rax")
+    var ty = baseTy
+    var elem = "i32"
+    if (tyIsArray(ty)) { elem = elemTy(ty) } else if (tyIsPointer(ty)) { elem = pointee(ty) }
+    var scale = backendTypeSize(elem)
+    if (scale == 1) { A.line("addq %rcx, %rax") } else {
+        A.line("imulq $" + ("" + scale) + ", %rcx")
+        A.line("addq %rcx, %rax")
+    }
+    expectPunct(P, "]")
+}
+
+fun emitMemberAddress(view mut Asm A, view mut FnGen F, view mut Cursor P, view string name) -> string {
+    var baseTy = fnType(F, name)
+    var arrow = false
+    if (P.isPunct("->")) {
+        P.take()
+        arrow = true
+    } else {
+        expectPunct(P, ".")
+    }
+    var field = P.take()
+    if (field.kind != "id") { parseFail(P, "expected field name") }
+    F.lastField = copy(field.text)
+    if (arrow) {
+        emitLoad(A, F, name)
+        baseTy = pointee(baseTy)
+    } else {
+        emitAddressName(A, F, name)
+    }
+    F.lastFieldBase = copy(baseTy)
+    var off = fnFieldOffset(F, baseTy, field.text)
+    if (off > 0) { A.line("addq $" + ("" + off) + ", %rax") }
+    return fnFieldType(F, baseTy, field.text)
+}
+
+fun emitAddress(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    F.lastField = ""
+    F.lastFieldBase = ""
+    if (P.isPunct("*")) {
+        P.take()
+        emitUnary(A, F, P)
+        return 0
+    }
+    var t = P.take()
+    if (t.kind != "id") {
+        parseFail(P, "expected lvalue")
+    }
+    var name = copy(t.text)
+    if (P.isPunct("[")) {
+        emitIndexAddress(A, F, P, name)
+    } else if (P.isPunct(".") || P.isPunct("->")) {
+        emitMemberAddress(A, F, P, name)
+    } else {
+        emitAddressName(A, F, name)
+    }
+    return 0
+}
+
+fun emitLoadIndirect(view mut Asm A, view string ty) {
+    if (tyIsPointer(ty) || ty == "i64" || ty == "u64") {
+        A.line("movq (%rax), %rax")
+    } else if (ty == "i8" || ty == "u8") {
+        if (ty == "i8") { A.line("movsbl (%rax), %eax") } else { A.line("movzbl (%rax), %eax") }
+    } else if (ty == "i16" || ty == "u16") {
+        if (ty == "i16") { A.line("movswl (%rax), %eax") } else { A.line("movzwl (%rax), %eax") }
+    } else {
+        A.line("movl (%rax), %eax")
+    }
+}
+
+fun emitStoreIndirect(view mut Asm A, view string ty) {
+    if (tyIsPointer(ty) || ty == "i64" || ty == "u64") {
+        A.line("movq %rax, (%rcx)")
+    } else if (ty == "i8" || ty == "u8") {
+        A.line("movb %al, (%rcx)")
+    } else if (ty == "i16" || ty == "u16") {
+        A.line("movw %ax, (%rcx)")
+    } else {
+        A.line("movl %eax, (%rcx)")
+    }
+}
+
+fun emitFloatPrimary(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    var t = P.take()
+    if (t.kind == "flo") {
+        var label = A.floatLiteral(t.text)
+        A.line("movsd " + label + "(%rip), %xmm0")
+        return 0
+    }
+    if (t.kind == "num") {
+        A.line("movl $" + copy(t.text) + ", %eax")
+        A.line("cvtsi2sdl %eax, %xmm0")
+        return 0
+    }
+    if (t.kind == "id") {
+        var ty = fnType(F, t.text)
+        var off = fnLocal(F, t.text)
+        if (tyIsFloat(ty) && off != 0) {
+            A.line("movsd -" + ("" + off) + "(%rbp), %xmm0")
+        } else {
+            parseFail(P, "unsupported floating expression")
+        }
+        return 0
+    }
+    if (t.kind == "pn" && t.text == "(") {
+        emitFloatExpr(A, F, P, 1)
+        expectPunct(P, ")")
+        return 0
+    }
+    parseFail(P, "expected floating expression")
+    return 0
+}
+
+fun emitFloatUnary(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    if (P.isPunct("-")) {
+        P.take()
+        emitFloatUnary(A, F, P)
+        A.line("xorpd %xmm1, %xmm1")
+        A.line("subsd %xmm0, %xmm1")
+        A.line("movapd %xmm1, %xmm0")
+        return 0
+    }
+    return emitFloatPrimary(A, F, P)
+}
+
+fun emitFloatExpr(view mut Asm A, view mut FnGen F, view mut Cursor P, int minPrec) -> int {
+    emitFloatUnary(A, F, P)
+    while (true) {
+        var t = P.peek()
+        if (isBinary(t) == false) { break }
+        var prec = asmOpPrec(t.text)
+        if (prec < minPrec) { break }
+        var op = copy(t.text)
+        P.take()
+        A.line("subq $8, %rsp")
+        A.line("movsd %xmm0, (%rsp)")
+        emitFloatExpr(A, F, P, prec + 1)
+        A.line("movsd (%rsp), %xmm1")
+        A.line("addq $8, %rsp")
+        if (op == "+") { A.line("addsd %xmm0, %xmm1") }
+        if (op == "-") { A.line("subsd %xmm0, %xmm1") }
+        if (op == "*") { A.line("mulsd %xmm0, %xmm1") }
+        if (op == "/") { A.line("divsd %xmm0, %xmm1") }
+        if (op == "==" || op == "!=" || op == "<" || op == "<="
+            || op == ">" || op == ">=") {
+            A.line("ucomisd %xmm0, %xmm1")
+            if (op == "==") { A.line("sete %al") }
+            if (op == "!=") { A.line("setne %al") }
+            if (op == "<") { A.line("setb %al") }
+            if (op == "<=") { A.line("setbe %al") }
+            if (op == ">") { A.line("seta %al") }
+            if (op == ">=") { A.line("setae %al") }
+            A.line("movzbl %al, %eax")
+            continue
+        }
+        A.line("movapd %xmm1, %xmm0")
+    }
+    return 0
+}
+
+fun callArgCount(view Cursor P) -> int {
+    if (P.isPunct(")")) {
+        return 0
+    }
+    var depth = 0
+    var count = 1
+    var j = P.i
+    while (j < arrays.length(P.toks)) {
+        var t = arrays.at(P.toks, j)
+        if (t.kind == "pn" && t.text == "(") { depth = depth + 1 }
+        if (t.kind == "pn" && t.text == ")") {
+            if (depth == 0) { break }
+            depth = depth - 1
+        }
+        if (depth == 0 && t.kind == "pn" && t.text == ",") {
+            count = count + 1
+        }
+        j = j + 1
+    }
+    return count
+}
+
+fun emitBuiltinVaStart(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    if (F.variadic == false) { parseFail(P, "__builtin_va_start requires a variadic function") }
+    expectPunct(P, "(")
+    var ap = P.take()
+    if (ap.kind != "id") { parseFail(P, "__builtin_va_start requires a va_list") }
+    expectPunct(P, ",")
+    var last = P.take()
+    if (last.kind != "id") { parseFail(P, "__builtin_va_start requires the last named parameter") }
+    expectPunct(P, ")")
+    var off = fnLocal(F, ap.text)
+    if (off == 0) { parseFail(P, "unknown va_list variable") }
+    if (F.namedParams >= 6) {
+        A.line("leaq 16(%rbp), %rax")
+    } else {
+        var saveOff = (F.namedParams + 1) * 8
+        A.line("leaq -" + ("" + saveOff) + "(%rbp), %rax")
+    }
+    A.line("movq %rax, -" + ("" + off) + "(%rbp)")
+    A.line("movl $0, %eax")
+    return 0
+}
+
+fun emitBuiltinVaArg(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    expectPunct(P, "(")
+    var ap = P.take()
+    if (ap.kind != "id") { parseFail(P, "__builtin_va_arg requires a va_list") }
+    expectPunct(P, ",")
+    var ty = fnParseBase(F, P)
+    while (P.isPunct("*")) {
+        P.take()
+        ty = "*" + ty
+    }
+    expectPunct(P, ")")
+    if (tyIsFloat(ty) || tyIsArray(ty) || tyIsStruct(ty) || tyIsUnion(ty)) {
+        parseFail(P, "__builtin_va_arg currently supports integer and pointer types")
+    }
+    var off = fnLocal(F, ap.text)
+    if (off == 0) { parseFail(P, "unknown va_list variable") }
+    A.line("movq -" + ("" + off) + "(%rbp), %rcx")
+    A.line("movq %rcx, %rax")
+    emitLoadIndirect(A, ty)
+    A.line("subq $8, %rcx")
+    A.line("movq %rcx, -" + ("" + off) + "(%rbp)")
+    return 0
+}
+
+fun emitBuiltinVaEnd(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    expectPunct(P, "(")
+    var ap = P.take()
+    if (ap.kind != "id") { parseFail(P, "__builtin_va_end requires a va_list") }
+    expectPunct(P, ")")
+    A.line("movl $0, %eax")
+    return 0
+}
+
+fun emitPrimary(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    var t = P.take()
+    if (t.kind == "num") {
+        A.line("movl $" + copy(t.text) + ", %eax")
+        return 0
+    }
+    if (t.kind == "chr") {
+        A.line("movl $" + ("" + t.ival) + ", %eax")
+        return 0
+    }
+    if (t.kind == "str") {
+        var label = A.stringLiteral(t.text)
+        A.line("leaq " + label + "(%rip), %rax")
+        return 0
+    }
+    if (t.kind == "id") {
+        var name = copy(t.text)
+        var enumValue = fnConst(F, name)
+        if (enumValue != -2147483648 && P.isPunct("(") == false) {
+            A.line("movl $" + ("" + enumValue) + ", %eax")
+            return 0
+        }
+        if (P.isPunct("(")) {
+            if (name == "__builtin_va_start") { return emitBuiltinVaStart(A, F, P) }
+            if (name == "__builtin_va_arg") { return emitBuiltinVaArg(A, F, P) }
+            if (name == "__builtin_va_end") { return emitBuiltinVaEnd(A, F, P) }
+            var calleeTy = fnGlobalType(F, name)
+            if (fnLocal(F, name) != 0) { calleeTy = fnType(F, name) }
+            var variadicCall = functionIsVariadic(calleeTy)
+            P.take()
+            var argc = callArgCount(P)
+            var odd = argc % 2 == 1
+            if (odd) {
+                // Reserve the alignment word below the arguments.  It must
+                // be emitted before their pushes so reverse pops see args.
+                A.line("pushq $0")
+            }
+            var array[bool] argFloats = []
+            if (P.isPunct(")") == false) {
+                while (true) {
+                    var wantsFloat = tyIsFloat(functionParamType(F, name, arrays.length(argFloats)))
+                    var gotFloat = beginsFloat(F, P)
+                    emitExpr(A, F, P, 1)
+                    if (wantsFloat && gotFloat == false) {
+                        A.line("cvtsi2sdl %eax, %xmm0")
+                    }
+                    var passFloat = wantsFloat
+                    if (variadicCall && gotFloat) { passFloat = true }
+                    if (passFloat) {
+                        A.line("subq $8, %rsp")
+                        A.line("movsd %xmm0, (%rsp)")
+                    } else {
+                        A.line("pushq %rax")
+                    }
+                    arrays.push(argFloats, passFloat)
+                    if (P.isPunct(",")) {
+                        P.take()
+                        continue
+                    }
+                    break
+                }
+            }
+            if (P.isPunct(")") == false) {
+                parseFail(P, "expected ')' after call")
+            }
+            P.take()
+            if (argc > 6) {
+                parseFail(P, "calls with more than six integer arguments are not supported yet")
+            }
+            var j = argc - 1
+            while (j >= 0) {
+                if (arrays.at(argFloats, j)) {
+                    A.line("movsd (%rsp), " + asmXmm(j))
+                    A.line("addq $8, %rsp")
+                } else {
+                    A.line("popq " + asmPopReg(j))
+                }
+                j = j - 1
+            }
+            if (odd) {
+                A.line("addq $8, %rsp")
+            }
+            if (variadicCall) {
+                var floatCount = 0
+                var fi = 0
+                while (fi < arrays.length(argFloats)) {
+                    if (arrays.at(argFloats, fi)) { floatCount = floatCount + 1 }
+                    fi = fi + 1
+                }
+                A.line("movb $" + ("" + floatCount) + ", %al")
+            }
+            if (tyIsFunctionPointer(calleeTy)) {
+                emitLoad(A, F, name)
+                A.line("call *%rax")
+            } else {
+                A.line("call " + name)
+            }
+            return 0
+        }
+        if (P.isPunct("[")) {
+            emitIndexAddress(A, F, P, name)
+            var elemType = "i32"
+            var baseTy = fnType(F, name)
+            if (tyIsArray(baseTy)) { elemType = elemTy(baseTy) } else if (tyIsPointer(baseTy)) { elemType = pointee(baseTy) }
+            emitLoadIndirect(A, elemType)
+            return 0
+        }
+        if (P.isPunct(".") || P.isPunct("->")) {
+            var memberTy = emitMemberAddress(A, F, P, name)
+            emitLoadIndirect(A, memberTy)
+            var memberBits = fnFieldBits(F, F.lastFieldBase, F.lastField)
+            if (memberBits > 0) {
+                var memberShift = fnFieldBitOffset(F, F.lastFieldBase, F.lastField)
+                if (memberShift > 0) { A.line("shrl $" + ("" + memberShift) + ", %eax") }
+                var memberMask = (1 << memberBits) - 1
+                A.line("andl $" + ("" + memberMask) + ", %eax")
+            }
+            return 0
+        }
+        if (tyIsArray(fnType(F, name))) {
+            emitAddressName(A, F, name)
+            return 0
+        }
+        emitLoad(A, F, name)
+        return 0
+    }
+    if (t.kind == "pn" && t.text == "(") {
+        emitExpr(A, F, P, 1)
+        if (P.isPunct(")") == false) {
+            parseFail(P, "expected ')' in expression")
+        }
+        P.take()
+        return 0
+    }
+    parseFail(P, "expected expression")
+    return 0
+}
+
+fun emitUnary(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    if (P.isWord("sizeof")) {
+        P.take()
+        var hasParen = P.isPunct("(")
+        if (hasParen) { P.take() }
+        var size = 4
+        if (fnIsType(F, P)) {
+            var ty = fnParseBase(F, P)
+            while (P.isPunct("*")) {
+                P.take()
+                ty = "*" + ty
+            }
+            while (P.isPunct("[")) {
+                P.take()
+                var n = P.take()
+                expectPunct(P, "]")
+                ty = "[" + n.text + " x " + ty + "]"
+            }
+            size = fnTypeSize(F, ty)
+        } else if (P.peek().kind == "id") {
+            var name = P.take().text
+            size = fnTypeSize(F, fnType(F, name))
+        } else {
+            parseFail(P, "sizeof requires a type or expression")
+        }
+        if (hasParen) { expectPunct(P, ")") }
+        A.line("movl $" + ("" + size) + ", %eax")
+        return 0
+    }
+    if (P.isPunct("&")) {
+        P.take()
+        emitAddress(A, F, P)
+        return 0
+    }
+    if (P.isPunct("*")) {
+        P.take()
+        var derefTy = "i32"
+        if (P.peek().kind == "id") {
+            var pointed = fnType(F, P.peek().text)
+            if (tyIsPointer(pointed)) { derefTy = pointee(pointed) }
+        }
+        emitUnary(A, F, P)
+        emitLoadIndirect(A, derefTy)
+        return 0
+    }
+    if (P.isPunct("++") || P.isPunct("--")) {
+        var inc = P.take().text
+        var incName = ""
+        if (P.peek().kind == "id") { incName = copy(P.peek().text) }
+        var incTy = fnType(F, incName)
+        emitAddress(A, F, P)
+        A.line("pushq %rax")
+        if (tyIsPointer(incTy)) {
+            A.line("movq (%rax), %rcx")
+            var incScale = backendTypeSize(pointee(incTy))
+            if (inc == "++") { A.line("addq $" + ("" + incScale) + ", %rcx") }
+            if (inc == "--") { A.line("subq $" + ("" + incScale) + ", %rcx") }
+            A.line("popq %rax")
+            A.line("movq %rcx, (%rax)")
+            A.line("movq %rcx, %rax")
+            return 0
+        }
+        A.line("movl (%rax), %eax")
+        if (inc == "++") { A.line("addl $1, %eax") }
+        if (inc == "--") { A.line("subl $1, %eax") }
+        A.line("movl %eax, %ecx")
+        A.line("popq %rax")
+        A.line("movl %ecx, (%rax)")
+        A.line("movl %ecx, %eax")
+        return 0
+    }
+    if (P.isPunct("-")) {
+        P.take()
+        emitUnary(A, F, P)
+        A.line("negl %eax")
+        return 0
+    }
+    if (P.isPunct("+")) {
+        P.take()
+        emitUnary(A, F, P)
+        return 0
+    }
+    if (P.isPunct("!")) {
+        P.take()
+        emitUnary(A, F, P)
+        A.line("cmpl $0, %eax")
+        A.line("sete %al")
+        A.line("movzbl %al, %eax")
+        return 0
+    }
+    if (P.isPunct("~")) {
+        P.take()
+        emitUnary(A, F, P)
+        A.line("notl %eax")
+        return 0
+    }
+    if (P.isPunct("(")) {
+        var save = P.i
+        P.take()
+        if (isTypeWord(P)) {
+            var target = parseBaseType(P)
+            expectPunct(P, ")")
+            var sourceFloat = beginsFloat(F, P)
+            emitExpr(A, F, P, 11)
+            if (tyIsFloat(target) && sourceFloat == false) {
+                A.line("cvtsi2sdl %eax, %xmm0")
+            }
+            if (tyIsFloat(target) == false && sourceFloat) {
+                A.line("cvttsd2sil %xmm0, %eax")
+            }
+            if (tyIsFloat(target) == false && sourceFloat == false) {
+                emitIntegerCast(A, target)
+            }
+            return 0
+        }
+        P.i = save
+    }
+    return emitPrimary(A, F, P)
+}
+
+fun emitCompare(view mut Asm A, string op, bool unsigned) {
+    A.line("cmpl %ecx, %eax")
+    if (op == "==") { A.line("sete %al") }
+    if (op == "!=") { A.line("setne %al") }
+    if (op == "<") {
+        if (unsigned) { A.line("setb %al") } else { A.line("setl %al") }
+    }
+    if (op == "<=") {
+        if (unsigned) { A.line("setbe %al") } else { A.line("setle %al") }
+    }
+    if (op == ">") {
+        if (unsigned) { A.line("seta %al") } else { A.line("setg %al") }
+    }
+    if (op == ">=") {
+        if (unsigned) { A.line("setae %al") } else { A.line("setge %al") }
+    }
+    A.line("movzbl %al, %eax")
+}
+
+fun emitExpr(view mut Asm A, view mut FnGen F, view mut Cursor P, int minPrec) -> int {
+    if (beginsFloat(F, P)) {
+        return emitFloatExpr(A, F, P, minPrec)
+    }
+    var lhsName = ""
+    if (P.peek().kind == "id") { lhsName = copy(P.peek().text) }
+    emitUnary(A, F, P)
+    while (true) {
+        var t = P.peek()
+        if (t.kind == "pn" && t.text == "?") {
+            if (minPrec > 1) { break }
+            P.take()
+            var falseLabel = fnLabel(F)
+            var doneLabel = fnLabel(F)
+            A.line("cmpl $0, %eax")
+            A.line("je " + falseLabel)
+            emitExpr(A, F, P, 1)
+            expectPunct(P, ":")
+            A.line("jmp " + doneLabel)
+            A.line(falseLabel + ":")
+            emitExpr(A, F, P, 1)
+            A.line(doneLabel + ":")
+            continue
+        }
+        if (isBinary(t) == false) {
+            break
+        }
+        var prec = asmOpPrec(t.text)
+        if (prec < minPrec) {
+            break
+        }
+        var op = copy(t.text)
+        P.take()
+        if (op == "&&" || op == "||") {
+            emitShortCircuit(A, F, P, op, prec)
+            continue
+        }
+        A.line("pushq %rax")
+        emitExpr(A, F, P, prec + 1)
+        var lhsTy = fnType(F, lhsName)
+        if (lhsName != "" && fnLocal(F, lhsName) == 0) {
+            lhsTy = fnGlobalType(F, lhsName)
+        }
+        if (tyIsPointer(lhsTy) && tyIsFunctionPointer(lhsTy) == false
+            && (op == "+" || op == "-")) {
+            A.line("movslq %eax, %rcx")
+            var scale = backendTypeSize(pointee(lhsTy))
+            if (scale != 1) { A.line("imulq $" + ("" + scale) + ", %rcx") }
+        } else {
+            A.line("movl %eax, %ecx")
+        }
+        A.line("popq %rax")
+        if (tyIsPointer(lhsTy) && tyIsFunctionPointer(lhsTy) == false
+            && (op == "+" || op == "-")) {
+            if (op == "+") { A.line("addq %rcx, %rax") }
+            if (op == "-") { A.line("subq %rcx, %rax") }
+        }
+        if (op == "+" && (tyIsPointer(lhsTy) == false || tyIsFunctionPointer(lhsTy))) { A.line("addl %ecx, %eax") }
+        if (op == "-" && (tyIsPointer(lhsTy) == false || tyIsFunctionPointer(lhsTy))) { A.line("subl %ecx, %eax") }
+        if (op == "*") { A.line("imull %ecx, %eax") }
+        if (op == "/" || op == "%") {
+            if (integerIsUnsigned(lhsTy)) {
+                A.line("xorl %edx, %edx")
+                A.line("divl %ecx")
+            } else {
+                A.line("cltd")
+                A.line("idivl %ecx")
+            }
+            if (op == "%") { A.line("movl %edx, %eax") }
+        }
+        if (op == "&") { A.line("andl %ecx, %eax") }
+        if (op == "|") { A.line("orl %ecx, %eax") }
+        if (op == "^") { A.line("xorl %ecx, %eax") }
+        if (op == "<<") { A.line("sall %cl, %eax") }
+        if (op == ">>") {
+            if (integerIsUnsigned(lhsTy)) { A.line("shrl %cl, %eax") } else { A.line("sarl %cl, %eax") }
+        }
+        if (op == "&&" || op == "||") {
+            if (op == "&&") { A.line("andl %ecx, %eax") }
+            if (op == "||") { A.line("orl %ecx, %eax") }
+            A.line("cmpl $0, %eax")
+            A.line("setne %al")
+            A.line("movzbl %al, %eax")
+        }
+        if (op == "==" || op == "!=" || op == "<" || op == "<="
+            || op == ">" || op == ">=") {
+            emitCompare(A, op, integerIsUnsigned(lhsTy) || tyIsPointer(lhsTy))
+        }
+    }
+    return 0
+}
+
+fun expectPunct(view mut Cursor P, string s) {
+    if (P.isPunct(s) == false) {
+        parseFail(P, "expected '" + s + "'")
+    }
+    P.take()
+}
+
+fun emitReturn(view mut Asm A, view mut FnGen F, view mut Cursor P) {
+    P.take()
+    if (P.isPunct(";")) {
+        A.line("movl $0, %eax")
+    } else {
+        emitExpr(A, F, P, 1)
+    }
+    expectPunct(P, ";")
+    A.line("leave")
+    A.line("ret")
+    F.returned = true
+}
+
+fun emitClause(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    var save = P.i
+    var t = P.peek()
+    if (t.kind == "id") {
+        P.take()
+        if (P.isPunct("=")) {
+            P.take()
+            emitExpr(A, F, P, 1)
+            emitStore(A, F, t.text)
+            return 0
+        }
+        if (P.isPunct("+=") || P.isPunct("-=") || P.isPunct("*=")
+            || P.isPunct("/=") || P.isPunct("%=")) {
+            var assignOp = P.take().text
+            emitLoad(A, F, t.text)
+            A.line("pushq %rax")
+            emitExpr(A, F, P, 1)
+            A.line("movl %eax, %ecx")
+            A.line("popq %rax")
+            if (assignOp == "+=") { A.line("addl %ecx, %eax") }
+            if (assignOp == "-=") { A.line("subl %ecx, %eax") }
+            if (assignOp == "*=") { A.line("imull %ecx, %eax") }
+            if (assignOp == "/=") {
+                if (integerIsUnsigned(fnType(F, t.text))) { A.line("xorl %edx, %edx"); A.line("divl %ecx") } else { A.line("cltd"); A.line("idivl %ecx") }
+            }
+            if (assignOp == "%=") {
+                if (integerIsUnsigned(fnType(F, t.text))) { A.line("xorl %edx, %edx"); A.line("divl %ecx") } else { A.line("cltd"); A.line("idivl %ecx") }
+                A.line("movl %edx, %eax")
+            }
+            emitStore(A, F, t.text)
+            return 0
+        }
+        if (P.isPunct("++") || P.isPunct("--")) {
+            var op = P.take().text
+            emitLoad(A, F, t.text)
+            if (op == "++") { A.line("addl $1, %eax") }
+            if (op == "--") { A.line("subl $1, %eax") }
+            emitStore(A, F, t.text)
+            return 0
+        }
+        P.i = save
+    }
+    emitExpr(A, F, P, 1)
+    return 0
+}
+
+fun collectForPost(view mut Cursor P) -> array[Token] {
+    var array[Token] out = []
+    var depth = 0
+    while (P.atEnd() == false) {
+        var t = P.peek()
+        if (t.kind == "pn" && t.text == "(" ) { depth = depth + 1 }
+        if (t.kind == "pn" && t.text == ")") {
+            if (depth == 0) { break }
+            depth = depth - 1
+        }
+        arrays.push(out, copyToken(P.take()))
+    }
+    return out
+}
+
+fun emitStatement(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
+    if (P.isWord("return")) {
+        emitReturn(A, F, P)
+        return 0
+    }
+    if (P.isWord("if")) {
+        P.take()
+        expectPunct(P, "(")
+        emitExpr(A, F, P, 1)
+        expectPunct(P, ")")
+        var elseLabel = fnLabel(F)
+        var endLabel = fnLabel(F)
+        A.line("cmpl $0, %eax")
+        A.line("je " + elseLabel)
+        emitStatement(A, F, P)
+        if (P.isWord("else")) {
+            A.line("jmp " + endLabel)
+            A.line(elseLabel + ":")
+            P.take()
+            emitStatement(A, F, P)
+            A.line(endLabel + ":")
+        } else {
+            A.line(elseLabel + ":")
+        }
+        return 0
+    }
+    if (P.isWord("while")) {
+        P.take()
+        var beginLabel = fnLabel(F)
+        var doneLabel = fnLabel(F)
+        A.line(beginLabel + ":")
+        arrays.push(F.breakLabels, copy(doneLabel))
+        arrays.push(F.continueLabels, copy(beginLabel))
+        expectPunct(P, "(")
+        emitExpr(A, F, P, 1)
+        expectPunct(P, ")")
+        A.line("cmpl $0, %eax")
+        A.line("je " + doneLabel)
+        emitStatement(A, F, P)
+        A.line("jmp " + beginLabel)
+        A.line(doneLabel + ":")
+        F.breakLabels = arrays.remove_at(F.breakLabels, arrays.length(F.breakLabels) - 1)
+        F.continueLabels = arrays.remove_at(F.continueLabels, arrays.length(F.continueLabels) - 1)
+        return 0
+    }
+    if (P.isWord("do")) {
+        P.take()
+        var beginLabel = fnLabel(F)
+        var continueLabel = fnLabel(F)
+        var doneLabel = fnLabel(F)
+        A.line(beginLabel + ":")
+        arrays.push(F.breakLabels, copy(doneLabel))
+        arrays.push(F.continueLabels, copy(continueLabel))
+        emitStatement(A, F, P)
+        A.line(continueLabel + ":")
+        if (P.isWord("while") == false) {
+            parseFail(P, "expected while after do body")
+        }
+        P.take()
+        expectPunct(P, "(")
+        emitExpr(A, F, P, 1)
+        expectPunct(P, ")")
+        expectPunct(P, ";")
+        A.line("cmpl $0, %eax")
+        A.line("jne " + beginLabel)
+        A.line(doneLabel + ":")
+        F.breakLabels = arrays.remove_at(F.breakLabels, arrays.length(F.breakLabels) - 1)
+        F.continueLabels = arrays.remove_at(F.continueLabels, arrays.length(F.continueLabels) - 1)
+        return 0
+    }
+    if (P.isWord("for")) {
+        P.take()
+        expectPunct(P, "(")
+        if (P.isPunct(";")) {
+            P.take()
+        } else {
+            emitStatement(A, F, P)
+        }
+        var beginLabel = fnLabel(F)
+        var continueLabel = fnLabel(F)
+        var doneLabel = fnLabel(F)
+        A.line(beginLabel + ":")
+        if (P.isPunct(";")) {
+            P.take()
+        } else {
+            emitExpr(A, F, P, 1)
+            expectPunct(P, ";")
+            A.line("cmpl $0, %eax")
+            A.line("je " + doneLabel)
+        }
+        var post = collectForPost(P)
+        expectPunct(P, ")")
+        arrays.push(F.breakLabels, copy(doneLabel))
+        arrays.push(F.continueLabels, copy(continueLabel))
+        emitStatement(A, F, P)
+        A.line(continueLabel + ":")
+        var Q = Cursor(post)
+        if (Q.atEnd() == false) {
+            emitClause(A, F, Q)
+        }
+        A.line("jmp " + beginLabel)
+        A.line(doneLabel + ":")
+        F.breakLabels = arrays.remove_at(F.breakLabels, arrays.length(F.breakLabels) - 1)
+        F.continueLabels = arrays.remove_at(F.continueLabels, arrays.length(F.continueLabels) - 1)
+        return 0
+    }
+    if (P.isWord("switch")) {
+        P.take()
+        expectPunct(P, "(")
+        emitExpr(A, F, P, 1)
+        expectPunct(P, ")")
+        expectPunct(P, "{")
+        var bodyStart = P.i
+        var bodyEnd = bodyStart
+        var depth = 0
+        var j = bodyStart
+        while (j < arrays.length(P.toks)) {
+            var scan = arrays.at(P.toks, j)
+            if (scan.kind == "pn" && scan.text == "{") { depth = depth + 1 }
+            if (scan.kind == "pn" && scan.text == "}") {
+                if (depth == 0) {
+                    bodyEnd = j
+                    break
+                }
+                depth = depth - 1
+            }
+            j = j + 1
+        }
+        var array[int] caseValues = []
+        var array[int] caseStarts = []
+        var array[int] caseEnds = []
+        var array[string] caseLabels = []
+        var defaultStart = -1
+        depth = 0
+        j = bodyStart
+        while (j < bodyEnd) {
+            var scan2 = arrays.at(P.toks, j)
+            if (scan2.kind == "pn" && scan2.text == "{") { depth = depth + 1 }
+            if (scan2.kind == "pn" && scan2.text == "}") { depth = depth - 1 }
+            if (depth == 0 && scan2.kind == "id" && scan2.text == "case") {
+                if (j + 2 >= bodyEnd || arrays.at(P.toks, j + 1).kind != "num"
+                    || arrays.at(P.toks, j + 2).text != ":") {
+                    parseFail(P, "case requires an integer constant")
+                }
+                if (arrays.length(caseStarts) > 0) {
+                    caseEnds[arrays.length(caseEnds) - 1] = j
+                }
+                arrays.push(caseValues, arrays.at(P.toks, j + 1).ival)
+                arrays.push(caseStarts, j + 3)
+                arrays.push(caseEnds, bodyEnd)
+                arrays.push(caseLabels, fnLabel(F))
+                j = j + 3
+                continue
+            }
+            if (depth == 0 && scan2.kind == "id" && scan2.text == "default") {
+                if (j + 1 >= bodyEnd || arrays.at(P.toks, j + 1).text != ":") {
+                    parseFail(P, "default requires ':'")
+                }
+                defaultStart = j + 2
+                if (arrays.length(caseStarts) > 0) {
+                    caseEnds[arrays.length(caseEnds) - 1] = j
+                }
+                j = j + 2
+                continue
+            }
+            j = j + 1
+        }
+        var doneLabel = fnLabel(F)
+        var defaultLabel = ""
+        if (defaultStart >= 0) {
+            defaultLabel = fnLabel(F)
+        }
+        A.line("pushq %rax")
+        var ci = 0
+        while (ci < arrays.length(caseValues)) {
+            A.line("cmpl $" + ("" + arrays.at(caseValues, ci)) + ", (%rsp)")
+            A.line("je " + arrays.at(caseLabels, ci))
+            ci = ci + 1
+        }
+        if (defaultStart >= 0) {
+            A.line("jmp " + defaultLabel)
+        } else {
+            A.line("addq $8, %rsp")
+            A.line("jmp " + doneLabel)
+        }
+        arrays.push(F.breakLabels, copy(doneLabel))
+        ci = 0
+        while (ci < arrays.length(caseStarts)) {
+            A.line(arrays.at(caseLabels, ci) + ":")
+            P.i = arrays.at(caseStarts, ci)
+            var endAt = arrays.at(caseEnds, ci)
+            while (P.i < endAt) {
+                emitStatement(A, F, P)
+            }
+            ci = ci + 1
+        }
+        if (defaultStart >= 0) {
+            A.line(defaultLabel + ":")
+            P.i = defaultStart
+            while (P.i < bodyEnd) {
+                emitStatement(A, F, P)
+            }
+        }
+        A.line(doneLabel + ":")
+        A.line("addq $8, %rsp")
+        F.breakLabels = arrays.remove_at(F.breakLabels, arrays.length(F.breakLabels) - 1)
+        P.i = bodyEnd + 1
+        return 0
+    }
+    if (P.isWord("break")) {
+        if (arrays.length(F.breakLabels) == 0) {
+            parseFail(P, "break outside loop")
+        }
+        P.take()
+        expectPunct(P, ";")
+        A.line("jmp " + arrays.at(F.breakLabels, arrays.length(F.breakLabels) - 1))
+        return 0
+    }
+    if (P.isWord("continue")) {
+        if (arrays.length(F.continueLabels) == 0) {
+            parseFail(P, "continue outside loop")
+        }
+        P.take()
+        expectPunct(P, ";")
+        A.line("jmp " + arrays.at(F.continueLabels, arrays.length(F.continueLabels) - 1))
+        return 0
+    }
+    if (P.isWord("goto")) {
+        P.take()
+        var target = P.take()
+        if (target.kind != "id") { parseFail(P, "expected label after goto") }
+        expectPunct(P, ";")
+        A.line("jmp .L" + F.name + ".user." + target.text)
+        return 0
+    }
+    if (P.isPunct("{")) {
+        var scopeMark = arrays.length(F.locals)
+        P.take()
+        while (P.atEnd() == false && P.isPunct("}") == false) {
+            emitStatement(A, F, P)
+        }
+        expectPunct(P, "}")
+        F.locals = arrays.slice(F.locals, 0, scopeMark)
+        F.localTypes = arrays.slice(F.localTypes, 0, scopeMark)
+        F.offsets = arrays.slice(F.offsets, 0, scopeMark)
+        return 0
+    }
+    while (P.isWord("static") || P.isWord("extern")) {
+        P.take()
+    }
+    if (fnIsType(F, P)) {
+        var base = fnParseBase(F, P)
+        var D = parseDeclarator(P, base)
+        var off = fnAddLocalType(F, D.name, D.ctype)
+        if (P.isPunct("=")) {
+            P.take()
+            if (tyIsArray(D.ctype) && P.isPunct("{")) {
+                P.take()
+                var index = 0
+                var elemSize = backendTypeSize(elemTy(D.ctype))
+                while (P.atEnd() == false && P.isPunct("}") == false) {
+                    if (P.isPunct("[")) {
+                        P.take()
+                        var designated = P.take()
+                        if (designated.kind != "num") { parseFail(P, "array designator must be an integer") }
+                        index = designated.ival
+                        expectPunct(P, "]")
+                        expectPunct(P, "=")
+                    }
+                    var initTok = P.take()
+                    var elemOff = off + fnTypeSize(F, D.ctype) - elemSize - index * elemSize
+                    if (initTok.kind == "num") {
+                        A.line("movl $" + copy(initTok.text) + ", -" + ("" + elemOff) + "(%rbp)")
+                        index = index + 1
+                    } else if (initTok.kind == "chr") {
+                        A.line("movl $" + ("" + initTok.ival) + ", -" + ("" + elemOff) + "(%rbp)")
+                        index = index + 1
+                    }
+                }
+                if (P.isPunct("}")) { P.take() }
+            } else {
+                emitExpr(A, F, P, 1)
+                emitStore(A, F, D.name)
+            }
+        } else {
+            A.line("movl $0, -" + ("" + off) + "(%rbp)")
+        }
+        expectPunct(P, ";")
+        return 0
+    }
+    // Assignment or an expression statement.  Rewind after looking at the
+    // first identifier so calls and arithmetic use the same expression path.
+    var save = P.i
+    var first = P.peek()
+    if (first.kind == "id") {
+        P.take()
+        if (P.isPunct(":")) {
+            P.take()
+            A.line(".L" + F.name + ".user." + first.text + ":")
+            if (P.isPunct(";")) { P.take() }
+            return 0
+        }
+        if (P.isPunct("=")) {
+            P.take()
+            emitExpr(A, F, P, 1)
+            emitStore(A, F, first.text)
+            expectPunct(P, ";")
+            return 0
+        }
+        if (P.isPunct("+=") || P.isPunct("-=") || P.isPunct("*=")
+            || P.isPunct("/=") || P.isPunct("%=")) {
+            var compound = P.take().text
+            emitLoad(A, F, first.text)
+            A.line("pushq %rax")
+            emitExpr(A, F, P, 1)
+            A.line("movl %eax, %ecx")
+            A.line("popq %rax")
+            if (compound == "+=") { A.line("addl %ecx, %eax") }
+            if (compound == "-=") { A.line("subl %ecx, %eax") }
+            if (compound == "*=") { A.line("imull %ecx, %eax") }
+            if (compound == "/=") {
+                if (integerIsUnsigned(fnType(F, first.text))) { A.line("xorl %edx, %edx"); A.line("divl %ecx") } else { A.line("cltd"); A.line("idivl %ecx") }
+            }
+            if (compound == "%=") {
+                if (integerIsUnsigned(fnType(F, first.text))) { A.line("xorl %edx, %edx"); A.line("divl %ecx") } else { A.line("cltd"); A.line("idivl %ecx") }
+                A.line("movl %edx, %eax")
+            }
+            emitStore(A, F, first.text)
+            expectPunct(P, ";")
+            return 0
+        }
+        if (P.isPunct("++") || P.isPunct("--")) {
+            var incOp = P.take().text
+            var postTy = fnType(F, first.text)
+            emitLoad(A, F, first.text)
+            if (tyIsPointer(postTy)) {
+                var postScale = backendTypeSize(pointee(postTy))
+                if (incOp == "++") { A.line("addq $" + ("" + postScale) + ", %rax") }
+                if (incOp == "--") { A.line("subq $" + ("" + postScale) + ", %rax") }
+            } else {
+                if (incOp == "++") { A.line("addl $1, %eax") }
+                if (incOp == "--") { A.line("subl $1, %eax") }
+            }
+            emitStore(A, F, first.text)
+            expectPunct(P, ";")
+            return 0
+        }
+        P.i = save
+    }
+    if (first.kind == "id" && save + 1 < arrays.length(P.toks)
+        && arrays.at(P.toks, save + 1).kind == "pn"
+        && arrays.at(P.toks, save + 1).text == "(") {
+        P.i = save
+        emitExpr(A, F, P, 1)
+        expectPunct(P, ";")
+        return 0
+    }
+    if (first.kind == "id" || (first.kind == "pn" && first.text == "*")) {
+        P.i = save
+        emitAddress(A, F, P)
+        if (P.isPunct("=")) {
+            P.take()
+            A.line("pushq %rax")
+            emitExpr(A, F, P, 1)
+            A.line("movl %eax, %ecx")
+            A.line("popq %rax")
+            var assignBits = fnFieldBits(F, F.lastFieldBase, F.lastField)
+            if (assignBits > 0) {
+                var assignShift = fnFieldBitOffset(F, F.lastFieldBase, F.lastField)
+                var assignMask = (1 << assignBits) - 1
+                var clearMask = 0 - 1 ^ (assignMask << assignShift)
+                A.line("movq %rax, %r8")
+                A.line("movl (%r8), %eax")
+                A.line("andl $" + ("" + assignMask) + ", %ecx")
+                if (assignShift > 0) { A.line("shll $" + ("" + assignShift) + ", %ecx") }
+                A.line("andl $" + ("" + clearMask) + ", %eax")
+                A.line("orl %ecx, %eax")
+                A.line("movl %eax, (%r8)")
+            } else {
+                A.line("movl %ecx, (%rax)")
+            }
+            expectPunct(P, ";")
+            return 0
+        }
+        P.i = save
+    }
+    emitExpr(A, F, P, 1)
+    expectPunct(P, ";")
+    return 0
+}
+
+fun emitFunction(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C) {
+    var F = FnGen(D.name)
+    F.retType = functionReturnType(D.ctype)
+    F.variadic = D.variadic
+    F.namedParams = arrays.length(D.params)
+    if (F.variadic) { F.nextOffset = 64 }
+    F.structs = copy(C.structs)
+    var gi = 0
+    while (gi < arrays.length(C.globals)) {
+        arrays.push(F.globalNames, copy(arrays.at(C.globals, gi).name))
+        arrays.push(F.globalTypes, copy(arrays.at(C.globals, gi).ctype))
+        gi = gi + 1
+    }
+    F.typedefNames = copy(C.typedefNames)
+    F.typedefTypes = copy(C.typedefTypes)
+    F.constNames = copy(C.constNames)
+    F.constValues = copy(C.constValues)
+    A.line(".text")
+    A.line(".globl " + D.name)
+    A.line(".type " + D.name + ", @function")
+    A.line(D.name + ":")
+    A.line("pushq %rbp")
+    A.line("movq %rsp, %rbp")
+    // Fixed frame keeps the first backend simple while locals are still
+    // represented as explicit rbp-relative slots.
+    A.line("subq $256, %rsp")
+    if (F.variadic) {
+        A.line("movq %rdi, -8(%rbp)")
+        A.line("movq %rsi, -16(%rbp)")
+        A.line("movq %rdx, -24(%rbp)")
+        A.line("movq %rcx, -32(%rbp)")
+        A.line("movq %r8, -40(%rbp)")
+        A.line("movq %r9, -48(%rbp)")
+    }
+    var i = 0
+    while (i < arrays.length(D.paramNames)) {
+        if (arrays.at(D.paramNames, i) == "") {
+            i = i + 1
+            continue
+        }
+        var off = fnAddLocalType(F, arrays.at(D.paramNames, i), arrays.at(D.params, i))
+        if (tyIsFloat(arrays.at(D.params, i))) {
+            A.line("movsd " + asmXmm(i) + ", -" + ("" + off) + "(%rbp)")
+        } else if (tyIsPointer(arrays.at(D.params, i)) || arrays.at(D.params, i) == "i64") {
+            A.line("movq " + asmPopReg(i) + ", -" + ("" + off) + "(%rbp)")
+        } else if (arrays.at(D.params, i) == "i8" || arrays.at(D.params, i) == "u8") {
+            A.line("movb " + asmByteReg(i) + ", -" + ("" + off) + "(%rbp)")
+        } else if (arrays.at(D.params, i) == "i16" || arrays.at(D.params, i) == "u16") {
+            A.line("movw " + asmWordReg(i) + ", -" + ("" + off) + "(%rbp)")
+        } else {
+            A.line("movl " + asmReg(i) + ", -" + ("" + off) + "(%rbp)")
+        }
+        i = i + 1
+    }
+    expectPunct(P, "{")
+    while (P.atEnd() == false && P.isPunct("}") == false) {
+        emitStatement(A, F, P)
+    }
+    expectPunct(P, "}")
+    if (F.returned == false) {
+        A.line("movl $0, %eax")
+        A.line("leave")
+        A.line("ret")
+    }
+    A.line(".size " + D.name + ", .-" + D.name)
+}
+
+fun globalDirective(view string ty) -> string {
+    if (ty == "i8" || ty == "u8") { return ".byte" }
+    if (ty == "i16" || ty == "u16") { return ".short" }
+    if (ty == "f32") { return ".float" }
+    if (ty == "f64") { return ".double" }
+    if (tyIsPointer(ty)) { return ".quad" }
+    if (ty == "i64" || ty == "u64") { return ".quad" }
+    return ".long"
+}
+
+fun globalWidth(view string ty) -> int {
+    if (ty == "i8" || ty == "u8") { return 1 }
+    if (ty == "i16" || ty == "u16") { return 2 }
+    if (ty == "i64" || ty == "u64" || ty == "f64" || tyIsPointer(ty)) { return 8 }
+    return 4
+}
+
+fun emitGlobal(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C) {
+    if (tyIsArray(D.ctype)) {
+        var total = tySize(C, D.ctype)
+        var elem = elemTy(D.ctype)
+        A.line(".data")
+        A.line(".globl " + D.name)
+        A.line(".type " + D.name + ", @object")
+        A.line(D.name + ":")
+        var array[string] values = []
+        var valueCount = arrLen(D.ctype)
+        var vi = 0
+        while (vi < valueCount) {
+            arrays.push(values, "0")
+            vi = vi + 1
+        }
+        var cursor = 0
+        if (P.isPunct("=")) {
+            P.take()
+            if (P.isPunct("{")) { P.take() }
+            while (P.atEnd() == false && P.isPunct("}") == false) {
+                if (P.isPunct("[")) {
+                    P.take()
+                    var designated = P.take()
+                    if (designated.kind != "num") { ppFail(designated.line, "array designator must be an integer") }
+                    var target = designated.ival
+                    cursor = target
+                    expectPunct(P, "]")
+                    expectPunct(P, "=")
+                }
+                var at = P.take()
+                if (at.kind == "num") {
+                    if (cursor < valueCount) { values[cursor] = copy(at.text) }
+                    cursor = cursor + 1
+                } else if (at.kind == "chr") {
+                    if (cursor < valueCount) { values[cursor] = "" + at.ival }
+                    cursor = cursor + 1
+                }
+                if (P.isPunct(",")) { P.take() }
+            }
+            if (P.isPunct("}")) { P.take() }
+        }
+        vi = 0
+        while (vi < valueCount) {
+            A.line(globalDirective(elem) + " " + arrays.at(values, vi))
+            vi = vi + 1
+        }
+        A.line(".size " + D.name + ", " + ("" + total))
+        if (P.isPunct(";")) { P.take() }
+        return
+    }
+    var value = "0"
+    if (P.isPunct("=")) {
+        P.take()
+        var neg = false
+        if (P.isPunct("-")) {
+            P.take()
+            neg = true
+        }
+        var t = P.take()
+        if (t.kind == "num" || t.kind == "flo") {
+            value = copy(t.text)
+        } else if (t.kind == "chr") {
+            value = "" + t.ival
+        } else if (t.kind == "str" && tyIsPointer(D.ctype)) {
+            value = A.stringLiteral(t.text)
+        }
+        if (neg) { value = "-" + value }
+        skipInitializer(P)
+    }
+    A.line(".data")
+    A.line(".globl " + D.name)
+    A.line(".type " + D.name + ", @object")
+    A.line(D.name + ":")
+    if (tyIsArray(D.ctype) || tyIsStruct(D.ctype) || tyIsUnion(D.ctype)) {
+        A.line(".zero " + ("" + tySize(C, D.ctype)))
+        A.line(".size " + D.name + ", " + ("" + tySize(C, D.ctype)))
+    } else {
+        A.line(globalDirective(D.ctype) + " " + value)
+        A.line(".size " + D.name + ", " + ("" + globalWidth(D.ctype)))
+    }
+    if (P.isPunct(";")) { P.take() }
+}
+
+fun compileEnum(view mut Compiler C, view mut Cursor P) -> int {
+    P.take()
+    if (P.peek().kind == "id") { P.take() }
+    expectPunct(P, "{")
+    var value = 0
+    while (P.atEnd() == false && P.isPunct("}") == false) {
+        var name = P.take()
+        if (name.kind != "id") { parseFail(P, "expected enumerator") }
+        if (P.isPunct("=")) {
+            P.take()
+            var n = P.take()
+            if (n.kind != "num") { parseFail(P, "enumerator value must be an integer") }
+            value = n.ival
+        }
+        arrays.push(C.constNames, copy(name.text))
+        arrays.push(C.constValues, value)
+        if (P.isPunct(",")) { P.take() }
+        value = value + 1
+    }
+    expectPunct(P, "}")
+    if (P.isPunct(";")) { P.take() }
+    return 0
+}
+
+fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> string {
+    var P = Cursor(copyTokens(toks))
+    var A = Asm()
+    A.line(".text")
+    while (P.atEnd() == false) {
+        if (P.isWord("enum")) {
+            compileEnum(C, P)
+            continue
+        }
+        if (P.isWord("struct")) {
+            var save = P.i
+            P.take()
+            P.take()
+            if (P.isPunct("{")) {
+                P.i = save
+                parseStructDefinition(C, P)
+                if (P.isPunct(";")) { P.take() }
+                continue
+            }
+            P.i = save
+        }
+        if (P.isWord("union")) {
+            var usave = P.i
+            P.take()
+            P.take()
+            if (P.isPunct("{")) {
+                P.i = usave
+                parseUnionDefinition(C, P)
+                if (P.isPunct(";")) { P.take() }
+                continue
+            }
+            P.i = usave
+        }
+        if (P.isWord("typedef")) {
+            parseExternal(C, P)
+            continue
+        }
+        var external = false
+        while (P.isWord("static") || P.isWord("extern")) {
+            if (P.isWord("extern")) { external = true }
+            P.take()
+        }
+        if (isCompilerType(P, C) == false) {
+            parseFail(P, "expected external declaration")
+        }
+        var base = parseCompilerBaseType(P, C)
+        var D = parseDeclarator(P, copy(base))
+        var S = Symbol(D.name, D.ctype, P.peek().line)
+        S.function = D.function
+        S.params = copy(D.params)
+        compilerAdd(C, S)
+        if (D.function && P.isPunct("{")) {
+            emitFunction(A, D, P, C)
+        } else if (D.function) {
+            if (P.isPunct(";")) { P.take() }
+        } else if (external) {
+            if (P.isPunct(";")) { P.take() }
+        } else {
+            emitGlobal(A, D, P, C)
+        }
+    }
+    A.line(".section .note.GNU-stack,\"\",@progbits")
+    return A.text()
+}
