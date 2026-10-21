@@ -1,0 +1,148 @@
+# Native resolution of SHN_ABS and SHN_COMMON; host tools construct fixtures only.
+task test_symbols after build {
+    let workspace = test_workspace("symbols")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let reference = directory + "/reference"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+
+    # Separate common definitions combine the largest size AND largest alignment.
+    write(workspace + "/small.s", ".comm shared_bytes,8,64\n.section .note.GNU-stack,\"\",@progbits\n")
+    write(workspace + "/large.s", ".comm shared_bytes,128,8\n.section .note.GNU-stack,\"\",@progbits\n")
+    write(workspace + "/main.c", "extern unsigned char shared_bytes[128]; int main(void) { if (((unsigned long)shared_bytes & 63) != 0) return 1; for (int i=0;i<128;i++) if (shared_bytes[i] != 0) return 2; shared_bytes[127]=42; return shared_bytes[127]-42; }\n")
+    for unit in ["small", "large"] {
+        checked(workspace, "cc", ["-c", directory + "/" + unit + ".s", "-o", directory + "/" + unit + ".o"])
+    }
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/main.c", "-o", directory + "/main.o"])
+    for first in ["small", "large"] {
+        var second = "small"
+        if first == "small" { second = "large" }
+        checked(workspace, "cc", ["-no-pie", directory + "/main.o", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", reference])
+        checked(workspace, reference, [])
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", program])
+        checked(workspace, program, [])
+    }
+
+    # -fcommon host objects refer to the same allocated storage through the GOT.
+    write(workspace + "/common-first.c", "int common_value; int first(void) { common_value += 17; return common_value; }\n")
+    write(workspace + "/common-second.c", "int common_value; int second(void) { common_value += 25; return common_value; }\n")
+    write(workspace + "/common-main.c", "extern int common_value; int first(void); int second(void); int main(void) { if (common_value != 0 || first() != 17 || second() != 42) return 1; return common_value - 42; }\n")
+    for unit in ["first", "second"] {
+        checked(workspace, "cc", ["-fcommon", "-fPIC", "-c", directory + "/common-" + unit + ".c", "-o", directory + "/common-" + unit + ".o"])
+    }
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/common-main.c", directory + "/common-first.o", directory + "/common-second.o", "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "ar", ["rcs", directory + "/libcommon.a", directory + "/common-first.o", directory + "/common-second.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/common-main.c", directory + "/libcommon.a", "-o", program])
+    checked(workspace, program, [])
+
+    # Strong objects beat common definitions regardless of object order.
+    write(workspace + "/tentative.c", "int common_value;\n")
+    write(workspace + "/strong.c", "int common_value = 42;\n")
+    write(workspace + "/strong-main.c", "extern int common_value; int main(void) { return common_value - 42; }\n")
+    checked(workspace, "cc", ["-fcommon", "-c", directory + "/tentative.c", "-o", directory + "/tentative.o"])
+    checked(workspace, "cc", ["-c", directory + "/strong.c", "-o", directory + "/strong.o"])
+    for first in ["tentative", "strong"] {
+        var second = "tentative"
+        if first == "tentative" { second = "strong" }
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/strong-main.c", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", program])
+        checked(workspace, program, [])
+    }
+    # Common symbols also cause archive strong definitions to be extracted.
+    checked(workspace, "ar", ["rcs", directory + "/libstrong.a", directory + "/strong.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/strong-main.c", directory + "/tentative.o", directory + "/libstrong.a", "-o", program])
+    checked(workspace, program, [])
+    let duplicate = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/strong-main.c", directory + "/strong.o", directory + "/strong.o", "-o", rejected], 1)
+    require(contains(duplicate, "duplicate native symbol common_value"), "duplicate strong symbols incorrectly coalesced")
+
+    # Separate ABS definitions exercise RELA instead of assembler-folded constants.
+    write(workspace + "/absolute.s", ".globl abs_value\n.set abs_value,42\n.globl abs_wide\n.set abs_wide,0x123456789abcdef0\n.globl abs_negative\n.set abs_negative,-7\n.section .note.GNU-stack,\"\",@progbits\n")
+    write(workspace + "/abs-use.s", """.text
+.globl abs_check
+.type abs_check,@function
+abs_check:
+    movabsq $abs_negative, %rax
+    cmpq $-7, %rax
+    jne .Lbad
+    movq $abs_value, %rax
+    cmpq $42, %rax
+    jne .Lbad
+    leaq abs_value(%rip), %rax
+    cmpq $42, %rax
+    jne .Lbad
+    movq abs_value@GOTPCREL(%rip), %rax
+    cmpq $42, %rax
+    jne .Lbad
+    movabsq $abs_wide, %rax
+    movabsq $0x123456789abcdef0, %rcx
+    cmpq %rcx, %rax
+    jne .Lbad
+    xorl %eax,%eax
+    ret
+.Lbad:
+    movl $1,%eax
+    ret
+.size abs_check,.-abs_check
+.data
+.globl abs_stored
+.type abs_stored,@object
+abs_stored:
+    .quad abs_wide
+.size abs_stored,8
+.globl abs_small
+.type abs_small,@object
+abs_small:
+    .long abs_value
+.size abs_small,4
+.section .note.GNU-stack,"",@progbits
+""")
+    for unit in ["absolute", "abs-use"] {
+        checked(workspace, "cc", ["-Wa,-mrelax-relocations=no", "-c", directory + "/" + unit + ".s", "-o", directory + "/" + unit + ".o"])
+    }
+    let symbols = checked(workspace, "readelf", ["-Ws", directory + "/absolute.o"])
+    require(contains(symbols, "ABS abs_value"), "absolute fixture lost its ABS definition")
+    write(workspace + "/abs-main.c", "int abs_check(void); extern unsigned long abs_stored; extern int abs_small; int main(void) { return abs_check() || abs_stored != 0x123456789abcdef0UL || abs_small != 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/abs-main.c", directory + "/abs-use.o", directory + "/absolute.o", "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "ar", ["rcs", directory + "/libabsolute.a", directory + "/absolute.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/abs-main.c", directory + "/abs-use.o", directory + "/libabsolute.a", "-o", program])
+    checked(workspace, program, [])
+    let abs_duplicate = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/abs-main.c", directory + "/abs-use.o", directory + "/absolute.o", directory + "/absolute.o", "-o", rejected], 1)
+    require(contains(abs_duplicate, "duplicate native symbol abs_value"), "duplicate absolute symbols were not rejected")
+
+    # Assemble definitions and uses independently so GAS cannot fold an ABS
+    # relocation into a null-symbol addend, then localize the combined symbol.
+    for unit in ["first", "second"] {
+        var value = 17
+        if unit == "second" { value = 25 }
+        write(workspace + "/private-def.s", ".globl private_absolute\n.set private_absolute," + value + "\n.section .note.GNU-stack,\"\",@progbits\n")
+        write(workspace + "/private-use.s", ".text\n.globl private_" + unit + "\n.type private_" + unit + ",@function\nprivate_" + unit + ":\nmovq private_absolute@GOTPCREL(%rip),%rax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+        checked(workspace, "cc", ["-c", directory + "/private-def.s", "-o", directory + "/private-def.o"])
+        checked(workspace, "cc", ["-c", directory + "/private-use.s", "-o", directory + "/private-use.o"])
+        checked(workspace, "cc", ["-nostdlib", "-r", directory + "/private-def.o", directory + "/private-use.o", "-o", directory + "/private-" + unit + ".o"])
+        checked(workspace, "objcopy", ["--localize-symbol=private_absolute", directory + "/private-" + unit + ".o"])
+    }
+    write(workspace + "/private-main.c", "long private_first(void); long private_second(void); int main(void) { return private_first() + private_second() - 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/private-main.c", directory + "/private-first.o", directory + "/private-second.o", "-o", program])
+    checked(workspace, program, [])
+
+    # Oversized common storage and excessive alignment are rejected before output.
+    for unit in ["oversized", "alignment"] {
+        var contents = ".comm bad_common,16777217,4\n"
+        if unit == "alignment" { contents = ".comm bad_common,4,8192\n" }
+        write(workspace + "/" + unit + ".s", contents + ".section .note.GNU-stack,\"\",@progbits\n")
+        checked(workspace, "cc", ["-c", directory + "/" + unit + ".s", "-o", directory + "/" + unit + ".o"])
+        let error = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/strong-main.c", directory + "/strong.o", directory + "/" + unit + ".o", "-o", rejected], 1)
+        require(contains(error, "common ELF symbol"), "invalid common allocation was not rejected")
+    }
+    write(workspace + "/abs-overflow.s", ".data\n.long abs_wide\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/abs-overflow.s", "-o", directory + "/abs-overflow.o"])
+    let overflow = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/abs-main.c", directory + "/abs-use.o", directory + "/absolute.o", directory + "/abs-overflow.o", "-o", rejected], 1)
+    require(contains(overflow, "native unsigned relocation overflow"), "absolute relocation silently truncated")
+    require(!exists(workspace + "/rejected"), "failed symbol links wrote an output")
+    finish_workspace(workspace)
+    print("native ABS/common symbols: size/alignment, zero storage, strong/archive resolution, bounds: ok")
+}

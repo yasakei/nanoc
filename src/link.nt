@@ -39,6 +39,10 @@ fun nativeRelocationWidth(int kind) -> int {
     if(kind == 2 || kind == 4 || kind == 10 || kind == 11 || kind == 26 || nativeGotRelocation(kind)) { return 4 }
     throw "nanoc: unsupported native relocation type " + ("" + kind)
 }
+// Absolute symbols have no section base; common symbols are allocated only
+// after every object/archive has participated in strong-definition resolution.
+fun nativeAbsoluteSymbol(view NativeSymbol symbol) -> bool { return symbol.section == -1 }
+fun nativeCommonSymbol(view NativeSymbol symbol) -> bool { return symbol.section == -2 }
 fun nativeMerge(view mut NativeObject target, view NativeObject source, int objectId) {
     var array[int] bases = []
     var index = 0
@@ -57,13 +61,24 @@ fun nativeMerge(view mut NativeObject target, view NativeObject source, int obje
         var name = copy(symbol.name)
         if(symbol.global == false && symbol.section != 0) { name = ".native." + ("" + objectId) + "." + name }
         view mut var destination = target.symbols[nativeSymbol(target,name)]
-        if(symbol.section != 0) {
-            if(destination.section != 0) { throw "nanoc: duplicate native symbol " + name }
+        if(nativeCommonSymbol(symbol)) {
+            if(destination.section == 0) {
+                destination.section = -2
+                destination.value = symbol.value
+                destination.size = symbol.size
+                destination.kind = 1
+            } else if(nativeCommonSymbol(destination)) {
+                if(symbol.value > destination.value) { destination.value = symbol.value }
+                if(symbol.size > destination.size) { destination.size = symbol.size }
+            }
+        } else if(symbol.section != 0) {
+            if(destination.section != 0 && nativeCommonSymbol(destination) == false) { throw "nanoc: duplicate native symbol " + name }
             destination.section = symbol.section
-            destination.value = symbol.value + arrays.at(bases,symbol.section - 1)
+            destination.value = symbol.value
+            if(symbol.section > 0) { destination.value = destination.value + arrays.at(bases,symbol.section - 1) }
             destination.size = symbol.size
             destination.kind = symbol.kind
-        }
+        } else if(destination.section == 0 && destination.kind == 0) { destination.kind = symbol.kind }
         destination.global = symbol.global || symbol.section == 0
         index = index + 1
     }
@@ -171,10 +186,10 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
         var size = binaryUnsigned(bytes,position + 16,8)
         if(index == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
         if((info & 15) == 4) { arrays.push(symbolNames,""); index = index + 1; continue; }
-        if(section >= count) { throw "nanoc: absolute/common/extended ELF symbols are unsupported" }
-        if(section != 0 && arrays.at(sectionMap,section) == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
+        if(section >= count && section != 65521 && section != 65522) { throw "nanoc: extended/reserved ELF section indices are unsupported" }
+        if(section > 0 && section < count && arrays.at(sectionMap,section) == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
         if((info >> 4) > 1 || visibility != 0) { throw "nanoc: weak or non-default-visibility ELF symbols are unsupported" }
-        if((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 3) { throw "nanoc: unsupported ELF symbol kind" }
+        if((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 3 && ((info & 15) != 5 || section != 65522)) { throw "nanoc: unsupported ELF symbol kind" }
         if((info >> 4) == 0) { name = ".elf.local." + ("" + index) + "." + name }
         if(name == "") { throw "nanoc: unnamed global ELF symbol" }
         arrays.push(symbolNames,copy(name))
@@ -182,7 +197,20 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
         symbol.global = (info >> 4) == 1 || section == 0
         symbol.kind = info & 15
         symbol.size = size
-        if(section != 0) {
+        if(section == 65521) {
+            if(symbol.section != 0) { throw "nanoc: duplicate ELF symbol " + name }
+            symbol.section = -1
+            symbol.value = value
+        } else if(section == 65522) {
+            if(symbol.section != 0) { throw "nanoc: duplicate ELF symbol " + name }
+            if((info >> 4) != 1 || ((info & 15) != 1 && (info & 15) != 5)) { throw "nanoc: common ELF symbol requires global object binding" }
+            if(value == 0) { value = 1 }
+            if(value < 1 || value > 4096 || (value & (value - 1)) != 0) { throw "nanoc: unsupported common ELF symbol alignment" }
+            if(size < 0 || size > 16777216) { throw "nanoc: common ELF symbol exceeds 16 MiB" }
+            symbol.section = -2
+            symbol.value = value
+            symbol.kind = 1
+        } else if(section != 0) {
             var sectionSize = binaryUnsigned(bytes,shoff + section * 64 + 32,8)
             if(value < 0 || value > sectionSize || size < 0 || size > sectionSize - value) { throw "nanoc: ELF symbol exceeds section" }
             if(symbol.section != 0) { throw "nanoc: duplicate ELF symbol " + name }
@@ -320,6 +348,29 @@ fun nativeApplyRelocation(view mut array[int] bytes, int offset, int kind, int s
     if(kind == 10 && (value < 0 || value > 4294967295)) { throw "nanoc: native unsigned relocation overflow" }
     binaryPatch(bytes,offset,value,width)
 }
+fun nativeAllocateCommon(view mut NativeObject O) {
+    var index = 0
+    while(index < arrays.length(O.symbols)) {
+        view mut var symbol = O.symbols[index]
+        if(nativeCommonSymbol(symbol)) {
+            view mut var data = O.sections[1]
+            binaryAlign(data.bytes,symbol.value)
+            if(symbol.value > data.alignment) { data.alignment = symbol.value }
+            if(symbol.size > 16777216 - arrays.length(data.bytes)) { throw "nanoc: native common storage exceeds 16 MiB" }
+            symbol.value = arrays.length(data.bytes)
+            symbol.section = 2
+            var byteIndex = 0
+            while(byteIndex < symbol.size) { arrays.push(data.bytes,0); byteIndex = byteIndex + 1 }
+        }
+        index = index + 1
+    }
+}
+fun nativeSymbolAddress(view NativeSymbol symbol, view array[int] sectionAddresses, int gotAddress) -> int {
+    if(nativeAbsoluteSymbol(symbol)) { return symbol.value }
+    if(symbol.name == "_GLOBAL_OFFSET_TABLE_" && symbol.section == 0) { return gotAddress }
+    if(symbol.section <= 0 || symbol.section > arrays.length(sectionAddresses)) { throw "nanoc: unresolved native relocation symbol " + copy(symbol.name) }
+    return arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
+}
 fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[string] libraries) {
     var array[string] functions = []
     var array[string] objects = []
@@ -350,7 +401,7 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     index = 0
     while(index < arrays.length(O.symbols)) {
         if(O.symbols[index].name == "_start" && O.symbols[index].section != 0) { start = index }
-        if(O.symbols[index].name == "main" && O.symbols[index].section != 0 && O.symbols[index].kind == 2) { mainIndex = index }
+        if(O.symbols[index].name == "main" && O.symbols[index].section > 0 && O.symbols[index].kind == 2) { mainIndex = index }
         index = index + 1
     }
     if(start < 0 || mainIndex < 0) { throw "nanoc: native executable requires main and generated startup" }
@@ -468,11 +519,7 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         var slot = arrays.at(gotSlots,index)
         if(slot >= 0) {
             view var symbol = O.symbols[index]
-            var address = baseAddress + arrays.at(offsets,8)
-            if(symbol.name != "_GLOBAL_OFFSET_TABLE_" || symbol.section != 0) {
-                if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native GOT symbol " + copy(symbol.name) }
-                address = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
-            }
+            var address = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
             binaryPatch(bytes,arrays.at(offsets,8) + slot,address,8)
         }
         index = index + 1
@@ -484,11 +531,7 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
         if(si == arrays.length(O.symbols)) { throw "nanoc: missing native relocation symbol " + copy(relocation.symbol) }
         view var symbol = O.symbols[si]
-        var symbolAddress = baseAddress + arrays.at(offsets,8)
-        if(symbol.name != "_GLOBAL_OFFSET_TABLE_" || symbol.section != 0) {
-            if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native relocation" }
-            symbolAddress = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
-        }
+        var symbolAddress = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
         if(relocation.kind == 26) { symbolAddress = baseAddress + arrays.at(offsets,8) }
         if(nativeGotRelocation(relocation.kind)) {
             if(arrays.at(gotSlots,si) < 0) { throw "nanoc: missing native GOT slot" }
@@ -552,5 +595,6 @@ fun nativeLink(view mut NativeObject O, view string path, view array[string] lib
     }
     var startup = nativeAssemble(".text\n.globl _start\n.type _start, @function\n_start:\nxorl %ebp, %ebp\nmovq %rdx, %r9\npopq %rsi\nmovq %rsp, %rdx\nandq $-16, %rsp\npushq %rax\npushq %rsp\nxorl %r8d, %r8d\nxorl %ecx, %ecx\nleaq main(%rip), %rdi\ncall __libc_start_main\nhlt\n")
     nativeMerge(O,startup,-1)
+    nativeAllocateCommon(O)
     nativeWriteExecutable(O,path,libraries)
 }

@@ -18,6 +18,8 @@ class NativeSection {
 }
 class NativeSymbol {
     var string name
+    // Linker tags: 0 = undefined, -1 = absolute, -2 = pending common.
+    // Positive values index NativeObject.sections (one-based).
     var int section
     var int value
     var int size

@@ -14,7 +14,8 @@ opt-in native ELF linker is also available.
 - A host C toolchain providing `cc` for default executable linking
 - glibc and its x86-64 dynamic loader for `--native-link`
 
-Tests additionally use `gcc`, `ar`, `readelf`, `mktemp`, and a POSIX shell.
+Tests additionally use `gcc`, `ar`, `readelf`, `objcopy`, `mktemp`, and a POSIX
+shell.
 Test orchestration and assertions are written in Arq; Python is not required.
 
 ## Build
@@ -101,8 +102,15 @@ including archive members. The linker allocates real GOT slots without
 instruction relaxation; local definitions are resolved at link time, while
 imported function pointers consistently use the generated callable stub.
 
+Absolute (`SHN_ABS`) symbols and global common (`SHN_COMMON`) object symbols
+from ELF inputs are supported. Common declarations combine their maximum
+size and alignment, are zero-initialized at final layout, and yield to a
+strong definition regardless of object order. Strong definitions in archives
+can also replace common declarations. The current implementation materializes
+common storage in `.data` and limits it to 16 MiB with alignment up to 4096.
+
 PIE, TLS and large-model GOT relocations, data imports (including `stdout`
-and `optind`), weak/common/absolute symbols, non-default visibility, linker
+and `optind`), weak symbols, non-default visibility, linker
 scripts, `-Wl` flags, and constructor/destructor sections are not supported.
 Accepting PIC objects does not make the output PIE, nor does it guarantee
 that every host object is supported. Native linking stays opt-in
@@ -130,7 +138,7 @@ and retain failed-test artifacts for inspection.
 
 Individual suites can be run with `arq test_preprocessor`, `arq test_driver`,
 `arq test_abi`, `arq test_smoke`, `arq test_language`, `arq test_rejections`,
-`arq test_native`, `arq test_archive`, and `arq test_got`.
+`arq test_native`, `arq test_archive`, `arq test_got`, and `arq test_symbols`.
 Each depends on `build`; a full invocation builds once before the isolated test
 tasks run. The native suite hides the host toolchain with an empty `PATH`,
 checks ELF metadata, compares native and host-linked output, and exercises
@@ -141,6 +149,8 @@ dependency closure, input ordering, long names, padding, and malformed inputs.
 The GOT suite checks PIC/no-PLT and non-relaxable relocations at `-O0`/`-O2`,
 archive members, private locals, function-pointer identity, arbitrary addends,
 and overflow/bounds rejection, again with the toolchain hidden from nanoc.
+The symbol suite covers absolute values, common storage, strong overrides,
+archive resolution, alignment/size bounds, and duplicate definitions.
 
 Optionally compare the language and aggregate ABI tests with an installed TinyCC:
 
@@ -220,7 +230,7 @@ includes:
 
 - Thin archives, archive groups, and archive creation
 - Large-model GOT/TLS relocations and broader host-object compatibility
-- Weak/common/absolute symbols and data imports
+- Weak symbols and data imports
 - Constructor/destructor handling and additional ELF validation
 - PIE support and more portable shared-library lookup/deployment
 

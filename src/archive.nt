@@ -5,10 +5,12 @@ class NativeArchiveMember {
     var string name
     var array[int] bytes
     var array[string] exports
-    fun init(string name, array[int] bytes, array[string] exports) {
+    var array[string] strongExports
+    fun init(string name, array[int] bytes, array[string] exports, array[string] strongExports) {
         this.name = name
         this.bytes = bytes
         this.exports = exports
+        this.strongExports = strongExports
     }
 }
 fun nativeArchiveText(view array[int] bytes, int offset, int size) -> string {
@@ -45,7 +47,7 @@ fun nativeArchiveSlice(view array[int] bytes, int offset, int size) -> array[int
 }
 // Inspect only definitions during selection. Unsupported relocations in an
 // unused member must not cause errors, but a selected member is fully validated.
-fun nativeArchiveExports(view array[int] bytes) -> array[string] {
+fun nativeArchiveExports(view array[int] bytes, view mut array[string] strongExports) -> array[string] {
     nativeValidateElf(bytes,1)
     var array[string] exports = []
     var shoff = binaryUnsigned(bytes,40,8)
@@ -76,7 +78,10 @@ fun nativeArchiveExports(view array[int] bytes) -> array[string] {
                     var nameOffset = binaryUnsigned(bytes,position,4)
                     if(nameOffset >= stringsSize) { throw "nanoc: archive member symbol name out of bounds" }
                     var name = nativeReadString(bytes,stringsOffset + nameOffset,stringsOffset + stringsSize)
-                    if(name != "") { arrays.push(exports,copy(name)) }
+                    if(name != "") {
+                        arrays.push(exports,copy(name))
+                        if((info >> 4) == 1 && section != 65522) { arrays.push(strongExports,copy(name)) }
+                    }
                 }
                 si = si + 1
             }
@@ -145,8 +150,9 @@ fun nativeReadArchive(view string path) -> array[NativeArchiveMember] {
         if(name == "") { throw "nanoc: empty native archive member name" }
         try {
             var memberBytes = nativeArchiveSlice(bytes,payload,size)
-            var exports = nativeArchiveExports(memberBytes)
-            arrays.push(members,NativeArchiveMember(copy(name),memberBytes,exports))
+            var array[string] strongExports = []
+            var exports = nativeArchiveExports(memberBytes,strongExports)
+            arrays.push(members,NativeArchiveMember(copy(name),memberBytes,exports,strongExports))
         } catch(err) { throw "nanoc: archive " + copy(path) + "(" + name + "): " + err }
     }
     return members
@@ -156,6 +162,7 @@ fun nativeArchiveNeeded(view NativeObject O, view NativeArchiveMember member) ->
     while(index < arrays.length(O.symbols)) {
         view var symbol = O.symbols[index]
         if(symbol.section == 0 && arrays.index_of(member.exports,symbol.name) >= 0) { return true }
+        if(nativeCommonSymbol(symbol) && arrays.index_of(member.strongExports,symbol.name) >= 0) { return true }
         index = index + 1
     }
     return false
