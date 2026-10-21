@@ -1,0 +1,259 @@
+# PIE, protected data, TLS and legacy lifecycle paths must not use host tools.
+task test_pie after build {
+    let workspace = test_workspace("pie")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    for suite in ["stdio", "headers", "variadic", "int_width", "integer64", "floating_expr", "assignment_expr", "initializers", "static_storage", "long_double"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", "tests/c/" + suite + ".c", "-o", program])
+        checked(workspace, program, [])
+    }
+    let metadata = checked(workspace, "readelf", ["-hlWd", program])
+    require(contains(metadata, "DYN (Position-Independent Executable file)"), "-pie did not emit ET_DYN")
+    require(contains(metadata, "Flags: PIE") && contains(metadata, "INTERP"), "PIE dynamic metadata missing")
+    require(!contains(metadata, "TEXTREL") && !contains(metadata, "RWE"), "PIE weakened memory protections")
+    write(workspace + "/addresses.c", "#include <stdio.h>\nint value = 42; int *address = &value; int main(void) { if (address != &value || *address != 42) return 1; printf(\"%p\\n\", &value); return 0; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", directory + "/addresses.c", "-o", program])
+    let first = checked(workspace, program, [])
+    var different = false
+    for attempt in [1, 2, 3, 4] {
+        if checked(workspace, program, []) != first { different = true }
+    }
+    # Address randomization may be disabled by the test environment; ET_DYN and
+    # RELATIVE metadata remain mandatory even then.
+    let relocations = checked(workspace, "readelf", ["-Wr", program])
+    require(contains(relocations, "R_X86_64_RELATIVE"), "PIE static addresses lack load-bias relocations")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", "-run", directory + "/addresses.c"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", "-no-pie", directory + "/addresses.c", "-o", program])
+    require(contains(checked(workspace, "readelf", ["-h", program]), "EXEC (Executable file)"), "-no-pie did not override -pie")
+    # PIC host objects and archives remain valid with a randomized load address.
+    checked(workspace, "cc", ["-c", "tests/host/alignment.s", "-o", directory + "/alignment.o"])
+    for optimization in ["-O0", "-O2"] {
+        for suite in ["call_abi", "variadic_abi", "aggregate_abi", "tcc_aggregate_compat"] {
+            checked(workspace, "cc", [optimization, "-fPIC", "-fno-plt", "-c", "tests/host/" + suite + ".c", "-o", directory + "/host.o"])
+            checked(workspace, "ar", ["rcs", directory + "/libhost.a", directory + "/host.o"])
+            if suite == "call_abi" {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", "tests/c/" + suite + ".c", directory + "/libhost.a", directory + "/alignment.o", "-o", program])
+            } else {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", "tests/c/" + suite + ".c", directory + "/libhost.a", "-o", program])
+            }
+            checked(workspace, program, [])
+        }
+    }
+    # Reject non-PIC 32-bit absolute addresses instead of truncating load bias.
+    write(workspace + "/absolute.s", ".data\n.long main\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/absolute.s", "-o", directory + "/absolute.o"])
+    let absolute = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", directory + "/addresses.c", directory + "/absolute.o", "-o", rejected], 1)
+    require(contains(absolute, "PIE requires position-independent input"), "PIE absolute address was silently truncated")
+    write(workspace + "/textrel.s", ".text\n.quad main\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/textrel.s", "-o", directory + "/textrel.o"])
+    let textrel = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", directory + "/addresses.c", directory + "/textrel.o", "-o", rejected], 1)
+    require(contains(textrel, "text relocations are unsupported"), "PIE accepted writable runtime text")
+    require(!exists(workspace + "/rejected"), "failed PIE links wrote output")
+    finish_workspace(workspace)
+    print("native PIE: load bias, pointer initializers, PIC/archive ABI, no textrels/fallback: ok")
+}
+
+task test_protected after build {
+    let workspace = test_workspace("protected")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/provider.c", "__attribute__((visibility(\"protected\"))) int protected_value = 42; int *provider_address(void) { return &protected_value; } void provider_increment(void) { ++protected_value; }\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/provider.c", "-o", directory + "/libprotected.so"])
+    write(workspace + "/main.c", "extern int protected_value; int *provider_address(void); void provider_increment(void); int *initial = &protected_value; int main(void) { if (initial != provider_address() || &protected_value != initial || protected_value != 42) return 1; provider_increment(); if (protected_value != 43) return 2; protected_value=44; return *provider_address()!=44; }\n")
+    for mode in ["-no-pie", "-pie"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/main.c", directory + "/libprotected.so", "-o", program])
+        checked(workspace, program, [])
+        let relocations = checked(workspace, "readelf", ["-Wr", program])
+        require(!contains(relocations, "R_X86_64_COPY") && contains(relocations, "R_X86_64_GLOB_DAT"), "protected data was copied/preempted")
+        checked(workspace, "cc", ["-fPIC", "-c", directory + "/main.c", "-o", directory + "/host-main.o"])
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/host-main.o", directory + "/libprotected.so", "-o", program])
+        checked(workspace, program, [])
+    }
+    write(workspace + "/direct.s", ".text\n.globl direct\n.type direct,@function\ndirect:\nmovl protected_value(%rip),%eax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/direct.s", "-o", directory + "/direct.o"])
+    let direct = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/direct.o", directory + "/libprotected.so", "-o", rejected], 1)
+    require(contains(direct, "data requires GOT or 64-bit pointer relocations"), "protected direct PC32 reference was silently copied")
+    require(!exists(workspace + "/rejected"), "failed protected links wrote output")
+    finish_workspace(workspace)
+    print("native protected data: GOT/runtime pointer imports, identity, mutations, no copies: ok")
+}
+
+task test_tls after build {
+    let workspace = test_workspace("tls")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let reference = directory + "/reference"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/native.c", """__thread int tls_value = 17;
+static _Thread_local int tls_zero;
+int *tls_address(void) { ++tls_zero; tls_value += tls_zero; return &tls_value; }
+int tls_static(void) { static _Thread_local int value = 40; return ++value; }
+int main(void) { if (*tls_address()!=18 || *tls_address()!=20) return 1; return tls_static()!=41 || tls_static()!=42; }
+""")
+    for mode in ["-no-pie", "-pie"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/native.c", "-o", program])
+        checked(workspace, program, [])
+    }
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/native.c", "-o", directory + "/native.o"])
+    require(contains(checked(workspace, "readelf", ["-SWs", directory + "/native.o"]), "TLS"), "native TLS object lost TLS metadata")
+    checked(workspace, "cc", ["-no-pie", directory + "/native.o", "-o", reference])
+    checked(workspace, reference, [])
+    # Host models plus real pthread isolation, initialized and zero TLS data.
+    write(workspace + "/host.c", "__thread int tls_value = 17; static __thread int tls_zero; int *tls_address(void) { ++tls_zero; tls_value+=tls_zero; return &tls_value; }\n")
+    write(workspace + "/thread-main.c", """typedef unsigned long pthread_t;
+int pthread_create(unsigned long *, void *, void *(*)(void *), void *);
+int pthread_join(unsigned long, void **);
+int *tls_address(void);
+static int *thread_addresses[2];
+void *worker(void *argument) {
+    unsigned long id = (unsigned long)argument;
+    int *address = tls_address(); thread_addresses[id] = address;
+    if (*address != 18 || *tls_address() != 20) return (void *)1;
+    return (void *)0;
+}
+int main(void) {
+    pthread_t first, second; void *a; void *b;
+    int *main_address = tls_address(); if (*main_address != 18) return 1;
+    if (pthread_create(&first, 0, worker, (void *)0) || pthread_create(&second, 0, worker, (void *)1)) return 2;
+    if (pthread_join(first, &a) || pthread_join(second, &b) || a || b) return 3;
+    if (thread_addresses[0] == main_address || thread_addresses[1] == main_address || thread_addresses[0] == thread_addresses[1]) return 4;
+    return *main_address != 18;
+}
+""")
+    for optimization in ["-O0", "-O2"] {
+        for model in ["global-dynamic", "local-dynamic", "initial-exec", "local-exec", "tlsdesc"] {
+            if model == "tlsdesc" {
+                checked(workspace, "cc", [optimization, "-fPIC", "-mtls-dialect=gnu2", "-c", directory + "/host.c", "-o", directory + "/host.o"])
+            } else {
+                checked(workspace, "cc", [optimization, "-fPIC", "-ftls-model=" + model, "-c", directory + "/host.c", "-o", directory + "/host.o"])
+            }
+            checked(workspace, "cc", ["-pthread", directory + "/thread-main.c", directory + "/host.o", "-o", reference])
+            checked(workspace, reference, [])
+            for mode in ["-no-pie", "-pie"] {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/thread-main.c", directory + "/host.o", "-o", program])
+                checked(workspace, program, [])
+                let metadata = checked(workspace, "readelf", ["-lWs", program])
+                require(contains(metadata, "TLS"), "native executable lacks TLS program header")
+            }
+        }
+    }
+    # Native compiled TLS objects also work across threads and archive selection.
+    write(workspace + "/native-host.c", "__thread int tls_value = 17; static _Thread_local int tls_zero; int *tls_address(void) { ++tls_zero; tls_value+=tls_zero; return &tls_value; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/native-host.c", "-o", directory + "/native-host.o"])
+    checked(workspace, "ar", ["rcs", directory + "/libnative.a", directory + "/native-host.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-pie", directory + "/thread-main.c", directory + "/libnative.a", "-o", program])
+    checked(workspace, program, [])
+    # A TLS initializer containing an ordinary address must relocate the template
+    # before glibc copies it into each thread's independent TLS block.
+    write(workspace + "/template.c", "int ordinary = 42; __thread int *tls_pointer = &ordinary; int main(void) { return *tls_pointer != 42; }\n")
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/template.c", "-o", directory + "/template.o"])
+    for mode in ["-no-pie", "-pie"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/template.o", "-o", program])
+        checked(workspace, program, [])
+    }
+    # Shared TLS uses the provider module, never a process-wide data copy.
+    write(workspace + "/provider.c", "__thread int external_tls = 42; int *external_address(void) { return &external_tls; }\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/provider.c", "-o", directory + "/libtls.so"])
+    write(workspace + "/import.c", "extern __thread int external_tls; int *external_address(void); int main(void) { if(external_tls!=42 || &external_tls!=external_address()) return 1; ++external_tls; return *external_address()!=43; }\n")
+    for mode in ["-no-pie", "-pie"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/import.c", directory + "/libtls.so", "-o", program])
+        checked(workspace, program, [])
+        for model in ["global-dynamic", "initial-exec", "tlsdesc"] {
+            if model == "tlsdesc" {
+                checked(workspace, "cc", ["-O2", "-fPIC", "-mtls-dialect=gnu2", "-c", directory + "/import.c", "-o", directory + "/import.o"])
+            } else {
+                checked(workspace, "cc", ["-O2", "-fPIC", "-ftls-model=" + model, "-c", directory + "/import.c", "-o", directory + "/import.o"])
+            }
+            checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/import.o", directory + "/libtls.so", "-o", program])
+            checked(workspace, program, [])
+        }
+    }
+    # Invalid TLS usage must not be approximated as regular static data.
+    write(workspace + "/bad.c", "_Thread_local int value; int *constant_address = &value; int main(void) { return 0; }\n")
+    let static_address = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(static_address, "thread-local addresses are not constant"), "TLS address folded into static initializer")
+    write(workspace + "/bad.c", "int main(void) { _Thread_local int value; return value; }\n")
+    let automatic = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(automatic, "requires static or extern"), "automatic TLS storage was accepted")
+    write(workspace + "/marker.s", ".text\n.globl bad_marker\n.type bad_marker,@function\nbad_marker:\ncall *(%rax)\n.reloc 0,R_X86_64_TLSDESC_CALL,external_tls\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/marker.s", "-o", directory + "/marker.o"])
+    let marker = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/import.c", directory + "/marker.o", directory + "/libtls.so", "-o", rejected], 1)
+    require(contains(marker, "descriptor call lacks matching descriptor"), "unmatched TLS descriptor marker was accepted")
+    require(!exists(workspace + "/rejected"), "failed TLS links wrote output")
+    finish_workspace(workspace)
+    print("native TLS: GD/LD/IE/LE/TLSDESC, native declarations, pthread isolation, imports/archives: ok")
+}
+
+task test_legacy after build {
+    let workspace = test_workspace("legacy")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/legacy.s", """.section .init,"ax",@progbits
+pushq %rbp
+movq %rsp,%rbp
+leaq init_msg(%rip),%rdi
+call puts
+popq %rbp
+.section .fini,"ax",@progbits
+pushq %rbp
+movq %rsp,%rbp
+leaq fini_msg(%rip),%rdi
+call puts
+popq %rbp
+.text
+.type ctor,@function
+ctor:
+pushq %rbp
+movq %rsp,%rbp
+leaq ctor_msg(%rip),%rdi
+call puts
+popq %rbp
+ret
+.type dtor,@function
+dtor:
+pushq %rbp
+movq %rsp,%rbp
+leaq dtor_msg(%rip),%rdi
+call puts
+popq %rbp
+ret
+.section .ctors,"aw",@progbits
+.quad -1
+.quad ctor
+.quad 0
+.section .dtors,"aw",@progbits
+.quad -1
+.quad dtor
+.quad 0
+.section .rodata
+init_msg: .string "legacy init"
+fini_msg: .string "legacy fini"
+ctor_msg: .string "legacy ctor"
+dtor_msg: .string "legacy dtor"
+.section .note.GNU-stack,"",@progbits
+""")
+    checked(workspace, "cc", ["-c", directory + "/legacy.s", "-o", directory + "/legacy.o"])
+    write(workspace + "/main.c", "#include <stdio.h>\nint main(void) { puts(\"main\"); return 0; }\n")
+    for mode in ["-no-pie", "-pie"] {
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", mode, directory + "/main.c", directory + "/legacy.o", "-o", program])
+        equal(checked(workspace, program, []), "legacy init\nlegacy ctor\nmain\nlegacy dtor\nlegacy fini\n", "legacy initialization/finalization differs")
+        let metadata = checked(workspace, "readelf", ["-d", program])
+        require(contains(metadata, "(INIT)") && contains(metadata, "(FINI)"), "legacy DT_INIT/FINI tags missing")
+    }
+    finish_workspace(workspace)
+    print("native legacy lifecycle: ctor/dtor sentinels, init/fini fragments, PIE and fixed executables: ok")
+}

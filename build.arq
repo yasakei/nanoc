@@ -7,6 +7,7 @@ import "tests/arq/archive.arq"
 import "tests/arq/got.arq"
 import "tests/arq/symbols.arq"
 import "tests/arq/features.arq"
+import "tests/arq/gaps.arq"
 
 task build {
     run "ntsc build"
@@ -24,7 +25,7 @@ task test_smoke after build {
     print("standard I/O, headers, variadic functions, integer widths: ok")
 }
 
-task test after test_preprocessor, test_driver, test_abi, test_smoke, test_language, test_rejections, test_native, test_archive, test_got, test_symbols, test_weak, test_data_imports, test_lifecycle {}
+task test after test_preprocessor, test_driver, test_abi, test_smoke, test_language, test_rejections, test_native, test_archive, test_got, test_symbols, test_weak, test_data_imports, test_lifecycle, test_pie, test_protected, test_tls, test_legacy {}
 
 task check {
     test

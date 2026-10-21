@@ -48,6 +48,8 @@ The compiler is written to `build/debug/nanoc`.
 # Native ELF linking (experimental; no cc, as, or ld)
 ./build/debug/nanoc --native-link -o output input.c other.c library.o
 ./build/debug/nanoc --native-link -lm -o output input.c
+# Position-independent executable, still linked entirely natively
+./build/debug/nanoc --native-link -pie -o output input.c
 ./build/debug/nanoc --native-link input.c -L lib -lanswer -o output
 
 # Compile and execute, forwarding arguments and the program's exit status
@@ -65,7 +67,8 @@ when combining it with `-run`, since subsequent arguments go to the program.
 ### Experimental native linker
 
 `--native-link` merges C translation units and ELF64 x86-64 `.o` files into a
-non-PIE `ET_EXEC` executable. It generates its own startup code, initializes
+`ET_EXEC` executable by default, or an `ET_DYN` position-independent executable
+with `-pie`. It generates its own startup code, initializes
 via glibc's `__libc_start_main`, and emits dynamic symbols, a SysV hash table,
 GOT-backed function stubs, and eager dynamic relocations. The executable has
 separate RX/RW load segments and a non-executable stack.
@@ -121,9 +124,14 @@ Ordinary shared-library data imports, including libc's `stdin`, `stdout`,
 aligned storage and exports its symbols so both native references and
 preemptible shared-library references see the same data. Function-pointer
 and data-pointer initializers, PIC GOT references, arrays, and executable data
-overrides are tested. TLS, protected data, zero-sized data imports, and imports
-larger than 16 MiB are rejected. Copy storage is materialized in `.data`; this
-is a non-PIE implementation, not a general dynamic-linking replacement.
+overrides are tested. Fixed-address executables retain the copy-relocation path
+for preemptible ordinary data. Protected data imports and all PIE data imports
+instead use runtime GOT and 64-bit pointer relocations, preserving the shared
+library's storage and address identity without copies. The compiler now emits
+GOT-relative global addresses by default. Host objects that access protected
+imports through direct PC-relative memory relocations must be rebuilt with
+`-fPIC`; they are rejected rather than incorrectly copied. Zero-sized data
+imports and imports larger than 16 MiB still fail explicitly.
 
 Constructor/destructor functions can use
 `__attribute__((constructor))` / `__attribute__((destructor))`, optionally with
@@ -137,16 +145,49 @@ or `exit`. `_Exit` intentionally bypasses finalizers. Allocated host
 `.preinit_array` inputs are also supported. Archive members run their lifecycle
 functions only when selected.
 
-Legacy `.ctors`/`.dtors` lists and `.init`/`.fini` code fragments remain
-unsupported. Malformed arrays, null/sentinel entries, non-code pointers, and
-unsupported attributes fail explicitly. Only the three attributes above (and
-their double-underscore aliases) are supported; arbitrary GNU attributes are
-not silently ignored.
+Legacy `.ctors`/`.dtors` lists and `.init`/`.fini` code fragments are supported
+from host ELF objects. Legacy priorities are translated to initialization
+priorities, constructors run in reverse list order, and destructors in forward
+list order. Zero/-1 list sentinels are removed. Concatenated `.init`/`.fini`
+fragments are emitted as `DT_INIT`/`DT_FINI` routines with a trailing return when
+needed. As with modern arrays, malformed arrays and non-code function pointers
+are rejected. Unsupported declaration attributes fail explicitly; only `weak`,
+`constructor`, and `destructor` (plus their double-underscore aliases) are
+implemented.
 
-PIE, TLS and large-model GOT relocations, non-default visibility in object
-inputs, linker scripts, and `-Wl` flags remain unsupported. Accepting PIC
-objects does not make the output PIE, nor does it guarantee that every host
-object is supported. Native linking stays opt-in while this surface is verified.
+### PIE and thread-local storage
+
+`--native-link -pie` emits loader metadata with `DF_1_PIE`, relative load-bias
+relocations for local addresses, and dynamic relocations for imported addresses.
+Native C objects, static pointer initializers, lifecycle arrays, and compatible
+PIC host objects/archives are tested. `-no-pie` overrides `-pie`; the default
+remains a fixed-address executable. `-fPIC`/`-fPIE` spellings are accepted because
+the native global-address path is already GOT-relative. Writable/executable
+segments and runtime text relocations are not introduced. Non-PIC 32-bit absolute
+addresses and PC-relative references to absolute symbols in PIE inputs still
+produce explicit errors rather than truncated or incorrectly relocated output.
+
+C `__thread` and `_Thread_local` declarations emit an ELF TLS template and
+`STT_TLS` symbols. File-scope initialized/zero storage and block-scope `static`
+or `extern` TLS are supported; automatic block-scope TLS and constant static
+initializers containing a TLS address are rejected. Native access uses the
+global-dynamic model with `__tls_get_addr`. The linker also accepts host
+objects using global-dynamic, local-dynamic, initial-exec, local-exec, and
+TLSDESC models without host-linker relaxation. Shared-library TLS uses its
+provider module; local-exec and static offset relocations require definitions
+in the executable. A `PT_TLS` header, TLS GOT descriptors, and TLS dynamic
+relocations let glibc allocate independent storage for every thread. Tests
+exercise initialized/zero templates, pthread isolation, native/archive objects,
+shared imports, and pointer relocations in TLS templates, for PIE and non-PIE.
+TLS storage is currently materialized in the file, including zero-fill bytes,
+with the same 16 MiB per-section and 4096-byte alignment limits as other native
+inputs. Malformed/mismatched TLS symbols and descriptor calls fail explicitly.
+Unresolved weak TLS imports and raw input `DTPMOD64` relocations are not supported.
+
+Large-model GOT relocations, non-default visibility in object inputs, linker
+scripts, and `-Wl` flags remain unsupported. PIE and TLS support is a tested
+subset, not full GNU linker parity. Native linking stays opt-in and never
+silently falls back to `cc`, `as`, `ld`, or `ar`.
 
 ## Tests
 
@@ -171,7 +212,8 @@ and retain failed-test artifacts for inspection.
 Individual suites can be run with `arq test_preprocessor`, `arq test_driver`,
 `arq test_abi`, `arq test_smoke`, `arq test_language`, `arq test_rejections`,
 `arq test_native`, `arq test_archive`, `arq test_got`, `arq test_symbols`,
-`arq test_weak`, `arq test_data_imports`, and `arq test_lifecycle`.
+`arq test_weak`, `arq test_data_imports`, `arq test_lifecycle`, `arq test_pie`,
+`arq test_protected`, `arq test_tls`, and `arq test_legacy`.
 Each depends on `build`; a full invocation builds once before the isolated test
 tasks run. The native suite hides the host toolchain with an empty `PATH`,
 checks ELF metadata, compares native and host-linked output, and exercises
@@ -187,8 +229,10 @@ archive resolution, alignment/size bounds, and duplicate definitions.
 The feature suites additionally check weak resolution, libc/shared data and
 copy relocations, executable exports, lifecycle priorities, host-object
 interoperability, preinit, normal/early exit, and shared-library initialization.
-These native paths run with an empty `PATH`, so `cc`, `as`, `ld`, and `ar`
-cannot be used as a fallback.
+The gap-regression suites cover PIE/load-bias metadata and execution, protected
+data identity/mutations, all five tested TLS access models with real pthreads,
+TLS imports/templates, and legacy lifecycle routines. These native paths run
+with an empty `PATH`, so `cc`, `as`, `ld`, and `ar` cannot be used as a fallback.
 
 Optionally compare the language and aggregate ABI tests with an installed TinyCC:
 
@@ -245,6 +289,8 @@ so mixed-record TinyCC objects are not advertised as interoperable.
   returns, and direct/indirect calls interoperating with host C
 - GNU-style `weak`, `constructor`, and `destructor` declaration attributes
   with native object/linker support
+- C `__thread` / `_Thread_local` storage with native ELF TLS templates and
+  global-dynamic access
 
 ## Limitations
 
@@ -269,10 +315,11 @@ unsupported inputs and no implicit host-toolchain fallback. Remaining work
 includes:
 
 - Thin archives, archive groups, and archive creation
-- Large-model GOT/TLS relocations and broader host-object compatibility
+- Large-model GOT relocations, weak TLS imports, and broader host-object
+  compatibility
 - Broader symbol visibility/versioning and dynamic-linker compatibility
-- Legacy lifecycle formats and additional ELF validation
-- PIE support and more portable shared-library lookup/deployment
+- Additional ELF validation and malformed-input hardening
+- More portable shared-library lookup/deployment and broader PIE compatibility
 
 `--native-link` will remain opt-in while these paths are implemented and
 verified. Run `arq test_native` to check the current no-toolchain path.

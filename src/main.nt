@@ -91,13 +91,14 @@ fun loadTokens(string path, view array[string] includeDirs, string directives,
 }
 
 fun usage() {
-    say("usage: nanoc [--native-link] [-E|-S|-c|-run] [-o output] [-I dir] [-D name[=value]] [-U name] files...")
+    say("usage: nanoc [--native-link] [-pie|-no-pie] [-E|-S|-c|-run] [-o output] [-I dir] [-D name[=value]] [-U name] files...")
 }
 
 fun main() {
     var args = sys.args()
     var mode = "link"
     var nativeLinking = false
+    var nativePie = false
     var nativeObject = NativeObject()
     var array[string] nativeLibraries = []
     var array[string] libraryDirectories = []
@@ -130,6 +131,12 @@ fun main() {
             return
         } else if (a == "--native-link") {
             nativeLinking = true
+        } else if (a == "-pie") {
+            nativePie = true
+        } else if (a == "-no-pie") {
+            nativePie = false
+        } else if (a == "-fPIC" || a == "-fPIE" || a == "-fpic" || a == "-fpie") {
+            // Native global data addresses already use GOT-relative loads.
         } else if (a == "-E") {
             mode = "preprocess"
         } else if (a == "-S") {
@@ -298,8 +305,8 @@ fun main() {
             output = runDirectory + "/program"
         }
         if (nativeLinking) {
-            try { nativeLink(nativeObject,output,nativeLibraries) } catch(err) { say(err); status = 1 }
-        } else { status = process.exec("cc -no-pie -o " + shellQuote(output) + linkInputs + linkOptions) }
+            try { nativeLink(nativeObject,output,nativeLibraries,nativePie) } catch(err) { say(err); status = 1 }
+        } else { status = process.exec("cc " + (nativePie ? "-pie" : "-no-pie") + " -o " + shellQuote(output) + linkInputs + linkOptions) }
         if (status == 0 && mode == "run") {
             try {
                 if (nativeLinking) { status = nativeExecute(shellQuote(output) + runArgs) } else { status = process.exec(shellQuote(output) + runArgs) }

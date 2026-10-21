@@ -86,6 +86,7 @@ class FnGen {
     var array[string] continueLabels
     var array[StructInfo] structs
     var array[string] globalNames
+    var array[string] tlsNames
     var array[string] globalTypes
     var array[string] typedefNames
     var array[string] typedefTypes
@@ -114,6 +115,7 @@ class FnGen {
         this.continueLabels = []
         this.structs = []
         this.globalNames = []
+        this.tlsNames = []
         this.globalTypes = []
         this.typedefNames = []
         this.typedefTypes = []
@@ -166,7 +168,9 @@ fun staticCompiler(view FnGen F) -> Compiler {
     C.constValues = copy(F.constValues)
     index = 0
     while (index < arrays.length(F.globalNames)) {
-        arrays.push(C.globals, Symbol(copy(arrays.at(F.globalNames, index)), copy(arrays.at(F.globalTypes, index)), 0))
+        var symbol = Symbol(copy(arrays.at(F.globalNames,index)),copy(arrays.at(F.globalTypes,index)),0)
+        symbol.threadLocal = arrays.index_of(F.tlsNames,symbol.name) >= 0
+        arrays.push(C.globals,symbol)
         index = index + 1
     }
     index = 0
@@ -175,6 +179,7 @@ fun staticCompiler(view FnGen F) -> Compiler {
         if (label != "") {
             var symbol = Symbol(copy(arrays.at(F.locals, index)), copy(arrays.at(F.localTypes, index)), 0)
             symbol.linkName = copy(label)
+            symbol.threadLocal = arrays.index_of(F.tlsNames,label) >= 0
             compilerAdd(C, symbol)
         }
         index = index + 1
@@ -190,6 +195,8 @@ fun emitStaticLocal(view mut Asm A, view mut FnGen F, view mut Cursor P, view De
     arrays.push(F.storageLabels, copy(label))
     var D = Decl(copy(label), copy(source.ctype))
     D.internal = true
+    D.threadLocal = source.threadLocal
+    if(D.threadLocal) { arrays.push(F.tlsNames,copy(label)) }
     var C = staticCompiler(F)
     emitGlobal(A, D, P, C)
     A.line(".text")
@@ -722,49 +729,21 @@ fun emitLoad(view mut Asm A, view FnGen F, view string name) {
             if (ty == "i32") { A.line("movslq -" + ("" + off) + "(%rbp), %rax") } else { A.line("movl -" + ("" + off) + "(%rbp), %eax") }
         }
     } else {
-        var gty = fnType(F, name)
-        if (tyIsFunction(gty)) {
-            A.line("leaq " + fnStorageLabel(F, name) + "(%rip), %rax")
-        } else if (tyIsPointer(gty) || gty == "i64" || gty == "u64") {
-            A.line("movq " + fnStorageLabel(F, name) + "(%rip), %rax")
-        } else if (tyIsFloat(gty)) {
-            if (gty == "f32") {
-                A.line("movss " + fnStorageLabel(F, name) + "(%rip), %xmm0")
-                A.line("cvtss2sd %xmm0, %xmm0")
-            } else { A.line("movsd " + fnStorageLabel(F, name) + "(%rip), %xmm0") }
-        } else if (gty == "i8") {
-            A.line("movsbq " + fnStorageLabel(F, name) + "(%rip), %rax")
-        } else if (gty == "u8") {
-            A.line("movzbl " + fnStorageLabel(F, name) + "(%rip), %eax")
-        } else if (gty == "i16") {
-            A.line("movswq " + fnStorageLabel(F, name) + "(%rip), %rax")
-        } else if (gty == "u16") {
-            A.line("movzwl " + fnStorageLabel(F, name) + "(%rip), %eax")
-        } else {
-            if (gty == "i32") { A.line("movslq " + fnStorageLabel(F, name) + "(%rip), %rax") } else { A.line("movl " + fnStorageLabel(F, name) + "(%rip), %eax") }
-        }
+        var gty = fnType(F,name)
+        if(tyIsFunction(gty)) { emitAddressName(A,F,name) } else { emitAddressName(A,F,name); emitLoadIndirect(A,gty) }
     }
+
 }
 
 fun emitStore(view mut Asm A, view FnGen F, view string name) {
     var off = fnLocal(F, name)
     var ty = fnType(F, name)
     if (off == 0) {
-        var gty = fnType(F, name)
-        if (tyIsPointer(gty) || gty == "i64" || gty == "u64") {
-            A.line("movq %rax, " + fnStorageLabel(F, name) + "(%rip)")
-        } else if (tyIsFloat(gty)) {
-            if (gty == "f32") {
-                A.line("cvtsd2ss %xmm0, %xmm1")
-                A.line("movss %xmm1, " + fnStorageLabel(F, name) + "(%rip)")
-            } else { A.line("movsd %xmm0, " + fnStorageLabel(F, name) + "(%rip)") }
-        } else if (gty == "i8" || gty == "u8") {
-            A.line("movb %al, " + fnStorageLabel(F, name) + "(%rip)")
-        } else if (gty == "i16" || gty == "u16") {
-            A.line("movw %ax, " + fnStorageLabel(F, name) + "(%rip)")
-        } else {
-            A.line("movl %eax, " + fnStorageLabel(F, name) + "(%rip)")
-        }
+        A.line("pushq %rax")
+        emitAddressName(A,F,name)
+        A.line("movq %rax, %rcx")
+        A.line("popq %rax")
+        emitStoreIndirect(A,ty)
     } else if (tyIsFloat(ty)) {
         if (ty == "f32") {
             A.line("cvtsd2ss %xmm0, %xmm1")
@@ -792,7 +771,15 @@ fun emitAddressName(view mut Asm A, view FnGen F, view string name) {
             A.line("leaq -" + ("" + off) + "(%rbp), %rax")
         }
     } else {
-        A.line("leaq " + fnStorageLabel(F, name) + "(%rip), %rax")
+        if(arrays.index_of(F.tlsNames,fnStorageLabel(F,name)) >= 0) {
+            var padding = (16 - A.stackDepth % 16) % 16
+            if(padding != 0) { A.line("subq $" + ("" + padding) + ", %rsp") }
+            A.line(".byte 102")
+            A.line("leaq " + fnStorageLabel(F,name) + "@TLSGD(%rip), %rdi")
+            A.line(".byte 102"); A.line(".byte 102"); A.line(".byte 72")
+            A.line("call __tls_get_addr")
+            if(padding != 0) { A.line("addq $" + ("" + padding) + ", %rsp") }
+        } else { A.line("movq " + fnStorageLabel(F,name) + "@GOTPCREL(%rip), %rax") }
     }
 }
 
@@ -2105,19 +2092,24 @@ fun emitLocalDeclaration(view mut Asm A, view mut FnGen F, view mut Cursor P) ->
     }
     var external = false
     var persistent = false
-    while (P.isWord("static") || P.isWord("extern")) {
-        if (P.isWord("static")) { persistent = true } else { external = true }
+    var threadLocal = false
+    while(P.isWord("static") || P.isWord("extern") || P.isWord("__thread") || P.isWord("_Thread_local")) {
+        if(P.isWord("__thread") || P.isWord("_Thread_local")) { threadLocal = true } else if(P.isWord("static")) { persistent = true } else { external = true }
         P.take()
     }
     var base = fnParseBase(F, P)
     while (true) {
         var D = parseDeclarator(P, copy(base))
         if (external == false || P.isPunct("=")) { D.ctype = completeArrayType(P, D.ctype) }
+        D.threadLocal = threadLocal
+        if(threadLocal && persistent == false && external == false) { parseFail(P,"block-scope thread-local storage requires static or extern") }
+        if(threadLocal && D.function) { parseFail(P,"thread-local declaration must be an object") }
         if (external && persistent) { parseFail(P, "conflicting storage classes") }
         if (persistent && D.function) { parseFail(P, "block-scope function cannot be static") }
         if (persistent) { emitStaticLocal(A, F, P, D) } else if (external || D.function) {
             arrays.push(F.globalNames, copy(D.name))
             arrays.push(F.globalTypes, copy(D.ctype))
+            if(threadLocal) { arrays.push(F.tlsNames,copy(D.name)); A.line(".type " + D.name + ", @tls_object") }
             if (P.isPunct("=")) { parseFail(P, "block-scope external declaration cannot be initialized") }
         } else {
             var off = fnAddLocalType(F, D.name, D.ctype)
@@ -2391,7 +2383,7 @@ fun emitStatement(view mut Asm A, view mut FnGen F, view mut Cursor P) -> int {
         F.typedefTypes = arrays.slice(F.typedefTypes, 0, typedefMark)
         return 0
     }
-    if (fnIsType(F, P) || P.isWord("typedef")) { return emitLocalDeclaration(A, F, P) }
+    if (fnIsType(F, P) || P.isWord("typedef") || P.isWord("__thread") || P.isWord("_Thread_local")) { return emitLocalDeclaration(A, F, P) }
     if (P.peek().kind == "id" && P.i + 1 < arrays.length(P.toks)
         && arrays.at(P.toks, P.i + 1).text == ":") {
         var label = P.take().text
@@ -2419,6 +2411,7 @@ fun emitFunction(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C
     var gi = 0
     while (gi < arrays.length(C.globals)) {
         arrays.push(F.globalNames, copy(arrays.at(C.globals, gi).name))
+        if(C.globals[gi].threadLocal) { arrays.push(F.tlsNames,copy(C.globals[gi].name)) }
         arrays.push(F.globalTypes, copy(arrays.at(C.globals, gi).ctype))
         gi = gi + 1
     }
@@ -2569,6 +2562,7 @@ fun staticScalar(view mut Asm A, view mut Cursor P, view Compiler C, view string
             if (symbol.kind != "id") { parseFail(P, "address initializer requires a symbol") }
             var symbolIndex = compilerFind(C, symbol.text)
             if (symbolIndex < 0) { parseFail(P, "unknown symbol in static initializer") }
+            if(C.globals[symbolIndex].threadLocal) { parseFail(P,"thread-local addresses are not constant static initializers") }
             expression = arrays.at(C.globals, symbolIndex).linkName
             hasToken = true
             continue
@@ -2577,6 +2571,7 @@ fun staticScalar(view mut Asm A, view mut Cursor P, view Compiler C, view string
             if (index >= 0) { expression = expression + ("" + arrays.at(C.constValues, index)) } else if (tyIsPointer(ty)) {
                 var symbolIndex = compilerFind(C, token.text)
                 if (symbolIndex < 0) { parseFail(P, "unknown symbol in static initializer") }
+                if(C.globals[symbolIndex].threadLocal) { parseFail(P,"thread-local addresses are not constant static initializers") }
                 expression = expression + arrays.at(C.globals, symbolIndex).linkName
             } else { parseFail(P, "static initializer requires a constant expression") }
         } else if (token.text == "+" || token.text == "-" || token.text == "*" || token.text == "/"
@@ -2678,10 +2673,10 @@ fun emitGlobal(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C) 
     var size = tySize(C, D.ctype)
     var image = DataImage(size)
     if (P.isPunct("=")) { P.take(); emitStaticInitializer(A, image, P, C, D.ctype, 0) }
-    A.line(".data")
+    if(D.threadLocal) { A.line(".section .tdata,\"awT\",@progbits") } else { A.line(".data") }
     A.line(".balign " + ("" + tyAlign(C, D.ctype)))
     if (D.internal) { A.line(".local " + D.name) } else if(D.weak) { A.line(".weak " + D.name) } else { A.line(".globl " + D.name) }
-    A.line(".type " + D.name + ", @object")
+    if(D.threadLocal) { A.line(".type " + D.name + ", @tls_object") } else { A.line(".type " + D.name + ", @object") }
     A.line(D.name + ":")
     var index = 0
     while (index < arrays.length(image.bytes)) {
@@ -2756,8 +2751,8 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
         var external = false
         var internal = false
         var attributes = Decl("","")
-        while(P.isWord("static") || P.isWord("extern") || P.isWord("__attribute__") || P.isWord("__attribute")) {
-            if(P.isWord("static") || P.isWord("extern")) {
+        while(P.isWord("static") || P.isWord("extern") || P.isWord("__thread") || P.isWord("_Thread_local") || P.isWord("__attribute__") || P.isWord("__attribute")) {
+            if(P.isWord("__thread") || P.isWord("_Thread_local")) { attributes.threadLocal = true; P.take() } else if(P.isWord("static") || P.isWord("extern")) {
                 if(P.isWord("extern")) { external = true }
                 if(P.isWord("static")) { internal = true }
                 P.take()
@@ -2776,9 +2771,11 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
             if(priorIndex >= 0) {
                 view var prior = C.globals[priorIndex]
                 D.weak = D.weak || prior.weak
+                D.threadLocal = D.threadLocal || prior.threadLocal
                 if(D.constructor < 0) { D.constructor = prior.constructor }
                 if(D.destructor < 0) { D.destructor = prior.destructor }
             }
+            if(D.threadLocal && D.function) { parseFail(P,"thread-local declaration must be an object") }
             if(D.weak && D.internal) { parseFail(P,"weak declaration requires external linkage") }
             if(D.constructor >= 0 || D.destructor >= 0) {
                 if(D.function == false || functionReturnType(D.ctype) != "void" || arrays.length(D.params) != 0 || D.variadic) { parseFail(P,"constructor/destructor requires a void function with no parameters") }
@@ -2788,7 +2785,7 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
             var S = Symbol(copy(D.name), copy(D.ctype), P.peek().line)
             S.function = D.function
             S.params = copy(D.params)
-            S.weak = D.weak; S.constructor = D.constructor; S.destructor = D.destructor
+            S.weak = D.weak; S.threadLocal = D.threadLocal; S.constructor = D.constructor; S.destructor = D.destructor
             compilerAdd(C, S)
             if (D.function && P.isPunct("{")) {
                 emitFunction(A, D, P, C)
@@ -2809,6 +2806,7 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
         if(declaration.typedef) { declarationIndex = declarationIndex + 1; continue; }
         var kind = "@object"
         if(declaration.function) { kind = "@function" }
+        if(declaration.threadLocal) { kind = "@tls_object" }
         A.line(".type " + declaration.linkName + ", " + kind)
         if(declaration.weak) { A.line(".weak " + declaration.linkName) }
         declarationIndex = declarationIndex + 1

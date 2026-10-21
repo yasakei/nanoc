@@ -52,6 +52,7 @@ class Symbol {
     var bool function
     var bool typedef
     var bool weak
+    var bool threadLocal
     var int constructor
     var int destructor
     var array[string] params
@@ -64,6 +65,7 @@ class Symbol {
         this.function = false
         this.typedef = false
         this.weak = false
+        this.threadLocal = false
         this.constructor = -1
         this.destructor = -1
         this.params = []

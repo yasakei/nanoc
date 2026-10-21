@@ -33,10 +33,17 @@ fun nativeValidateElf(view array[int] bytes, int kind) {
 fun nativeGotRelocation(int kind) -> bool {
     return kind == 9 || kind == 41 || kind == 42
 }
+fun nativeTlsSlotKey(int symbolIndex, int model) -> int {
+    var slot = 0
+    if(model == 20) { slot = 1 }
+    if(model == 22) { slot = 2 }
+    if(model == 34 || model == 35) { slot = 3 }
+    return symbolIndex * 4 + slot
+}
 fun nativeRelocationWidth(int kind) -> int {
-    if(kind == 0) { return 0 }
-    if(kind == 1) { return 8 }
-    if(kind == 2 || kind == 4 || kind == 10 || kind == 11 || kind == 26 || nativeGotRelocation(kind)) { return 4 }
+    if(kind == 0 || kind == 35) { return 0 }
+    if(kind == 1 || kind == 16 || kind == 17 || kind == 18) { return 8 }
+    if(kind == 2 || kind == 4 || kind == 10 || kind == 11 || kind == 26 || kind == 19 || kind == 20 || kind == 21 || kind == 22 || kind == 23 || kind == 34 || nativeGotRelocation(kind)) { return 4 }
     throw "nanoc: unsupported native relocation type " + ("" + kind)
 }
 // Absolute symbols have no section base; common symbols are allocated only
@@ -65,6 +72,7 @@ fun nativeMerge(view mut NativeObject target, view NativeObject source, int obje
         var fresh = priorIndex == arrays.length(target.symbols)
         view mut var destination = target.symbols[nativeSymbol(target,name)]
         if(fresh) { destination.weak = symbol.weak }
+        if(destination.kind != 0 && symbol.kind != 0 && ((destination.kind == 6) != (symbol.kind == 6))) { throw "nanoc: incompatible TLS/non-TLS symbol " + name }
         if(symbol.section == 0) {
             if(destination.section == 0) {
                 destination.weak = destination.weak && symbol.weak
@@ -97,7 +105,9 @@ fun nativeMerge(view mut NativeObject target, view NativeObject source, int obje
     index = 0
     while(index < arrays.length(source.lifecycle)) {
         view var entry = source.lifecycle[index]
-        arrays.push(target.lifecycle,NativeLifecycle(entry.section,entry.offset + arrays.at(bases,entry.section - 1),entry.priority))
+        var merged = NativeLifecycle(entry.section,entry.offset + arrays.at(bases,entry.section - 1),entry.priority)
+        merged.legacy = entry.legacy
+        arrays.push(target.lifecycle,merged)
         index = index + 1
     }
     index = 0
@@ -151,22 +161,27 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
         var sectionNameOffset = binaryUnsigned(bytes,header,4)
         if(sectionNameOffset >= nameSize) { throw "nanoc: ELF section name out of bounds" }
         var sectionName = nativeReadString(bytes,nameOffset + sectionNameOffset,nameOffset + nameSize)
-        if(sectionName == ".ctors" || sectionName == ".dtors" || sectionName == ".init" || sectionName == ".fini") {
-            throw "nanoc: native constructor/destructor sections are unsupported"
-        }
+
         if(nativeLifecycleSection(sectionName) != 0 && (flags & 2) == 0) { throw "nanoc: lifecycle arrays require allocated sections" }
         // Notes describe producer/build metadata; they have no loadable C contents.
         if((flags & 2) != 0 && kind != 7) {
             if((flags & 5) == 5) { throw "nanoc: writable executable native input sections are unsupported" }
-            if((flags & 1536) != 0 || (flags & 256) != 0) { throw "nanoc: TLS or grouped native sections are unsupported" }
+            if((flags & 512) != 0 || (flags & 256) != 0) { throw "nanoc: grouped or link-ordered native sections are unsupported" }
             if(kind != 1 && kind != 8 && kind != 14 && kind != 15 && kind != 16) { throw "nanoc: unsupported allocated ELF section type " + ("" + kind) }
             var lifecycleSection = nativeLifecycleSection(sectionName)
             if((kind == 14 || kind == 15 || kind == 16) && lifecycleSection == 0) { throw "nanoc: unsupported lifecycle array name" }
-            if(lifecycleSection != 0 && (kind != 14 && kind != 15 && kind != 16)) { throw "nanoc: lifecycle section has invalid ELF type" }
-            if(lifecycleSection != 0 && (kind != lifecycleSection + 10 || size % 8 != 0)) { throw "nanoc: invalid lifecycle array size/type" }
+            var legacy = strings.starts_with(copy(sectionName),".ctors") || strings.starts_with(copy(sectionName),".dtors")
+            if(lifecycleSection != 0 && legacy == false && (kind != 14 && kind != 15 && kind != 16)) { throw "nanoc: lifecycle section has invalid ELF type" }
+            if(lifecycleSection != 0 && ((legacy == false && kind != lifecycleSection + 10) || (legacy && kind != 1) || size % 8 != 0)) { throw "nanoc: invalid lifecycle array size/type" }
             var destination = 3
             if((flags & 4) != 0) { destination = 1 } else if((flags & 1) != 0) { destination = 2 }
             if(lifecycleSection != 0) { destination = lifecycleSection }
+            if((flags & 1024) != 0) {
+                if(kind != 1 && kind != 8) { throw "nanoc: unsupported TLS section type" }
+                destination = 7
+            }
+            if(sectionName == ".init") { destination = 8 }
+            if(sectionName == ".fini") { destination = 9 }
             var alignment = binaryUnsigned(bytes,header + 48,8)
             if(alignment == 0) { alignment = 1 }
             if(lifecycleSection != 0 && alignment < 8) { alignment = 8 }
@@ -178,7 +193,9 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
             if(lifecycleSection != 0) {
                 var li = 0
                 while(li < size) {
-                    arrays.push(O.lifecycle,NativeLifecycle(destination,arrays.length(section.bytes) + li,nativeLifecyclePriority(sectionName)))
+                    var entry = NativeLifecycle(destination,arrays.length(section.bytes) + li,nativeLifecyclePriority(sectionName))
+                    entry.legacy = legacy
+                    arrays.push(O.lifecycle,entry)
                     li = li + 8
                 }
             }
@@ -221,7 +238,7 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
         if(section >= count && section != 65521 && section != 65522) { throw "nanoc: extended/reserved ELF section indices are unsupported" }
         if(section > 0 && section < count && arrays.at(sectionMap,section) == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
         if((info >> 4) > 2 || visibility != 0) { throw "nanoc: unsupported ELF binding or non-default visibility" }
-        if((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 3 && ((info & 15) != 5 || section != 65522)) { throw "nanoc: unsupported ELF symbol kind" }
+        if((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 3 && (info & 15) != 6 && ((info & 15) != 5 || section != 65522)) { throw "nanoc: unsupported ELF symbol kind" }
         if((info >> 4) == 0) { name = ".elf.local." + ("" + index) + "." + name }
         if(name == "") { throw "nanoc: unnamed global ELF symbol" }
         arrays.push(symbolNames,copy(name))
@@ -249,6 +266,7 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
             if(symbol.section != 0) { throw "nanoc: duplicate ELF symbol " + name }
             symbol.section = arrays.at(sectionMap,section)
             symbol.value = value + arrays.at(sectionBases,section)
+            if((symbol.kind == 6 && symbol.section != 7) || (symbol.section == 7 && symbol.kind != 6 && symbol.kind != 3)) { throw "nanoc: TLS symbol/section type mismatch" }
         }
         index = index + 1
     }
@@ -276,7 +294,7 @@ fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
                 if(symbolIndex < 0 || symbolIndex >= arrays.length(symbolNames)) { throw "nanoc: ELF relocation symbol out of bounds" }
                 var targetSize = binaryUnsigned(bytes,shoff + target * 64 + 32,8)
                 if(location < 0 || location > targetSize || width > targetSize - location) { throw "nanoc: ELF relocation offset out of bounds" }
-                if(arrays.at(sectionMap,target) >= 4 && (relocationKind != 1 || location % 8 != 0)) { throw "nanoc: lifecycle arrays require aligned 64-bit pointer relocations" }
+                if(arrays.at(sectionMap,target) >= 4 && arrays.at(sectionMap,target) <= 6 && (relocationKind != 1 || location % 8 != 0)) { throw "nanoc: lifecycle arrays require aligned 64-bit pointer relocations" }
                 if(relocationKind != 0) {
                     var name = copy(arrays.at(symbolNames,symbolIndex))
                     if(name == "") { throw "nanoc: native relocation references discarded or null symbol" }
@@ -428,13 +446,13 @@ fun nativeFlattenLifecycle(view mut NativeObject O) {
     index = 0
     while(index < arrays.length(O.symbols)) {
         view mut var symbol = O.symbols[index]
-        if(symbol.section >= 4) { symbol.value = symbol.value + arrays.at(bases,symbol.section - 1); symbol.section = 2 }
+        if(symbol.section >= 4 && symbol.section <= 6) { symbol.value = symbol.value + arrays.at(bases,symbol.section - 1); symbol.section = 2 }
         index = index + 1
     }
     index = 0
     while(index < arrays.length(O.relocations)) {
         view mut var relocation = O.relocations[index]
-        if(relocation.section >= 4) { relocation.offset = relocation.offset + arrays.at(bases,relocation.section - 1); relocation.section = 2 }
+        if(relocation.section >= 4 && relocation.section <= 6) { relocation.offset = relocation.offset + arrays.at(bases,relocation.section - 1); relocation.section = 2 }
         index = index + 1
     }
     index = 0
@@ -454,7 +472,7 @@ fun nativeLifecycleOrder(view NativeObject O, int section) -> array[int] {
         while(index < arrays.length(O.lifecycle)) {
             view var entry = O.lifecycle[index]
             if(entry.section == section && arrays.index_of(order,index) < 0) {
-                if(best < 0 || entry.priority < O.lifecycle[best].priority) { best = index }
+                if(best < 0 || entry.priority < O.lifecycle[best].priority || (entry.legacy && O.lifecycle[best].legacy && entry.priority == O.lifecycle[best].priority && (entry.section == 4 || entry.section == 5))) { best = index }
             }
             index = index + 1
         }
@@ -462,8 +480,38 @@ fun nativeLifecycleOrder(view NativeObject O, int section) -> array[int] {
     }
     return order
 }
-fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[string] libraries) {
+fun nativeFlattenLegacyCode(view mut NativeObject O) {
+    var array[int] bases = [0,0,0,0,0,0,0]
+    var index = 7
+    while(index < 9) {
+        view var source = O.sections[index]
+        view mut var text = O.sections[0]
+        binaryAlign(text.bytes,source.alignment)
+        var offset = arrays.length(text.bytes)
+        arrays.push(bases,offset)
+        if(arrays.length(source.bytes) > 0) {
+            if(index == 7) { O.initOffset = offset } else { O.finiOffset = offset }
+            nativeConcat(text.bytes,source.bytes)
+            if(arrays.at(text.bytes,arrays.length(text.bytes)-1) != 195) { arrays.push(text.bytes,195) }
+        }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(O.symbols)) {
+        view mut var symbol = O.symbols[index]
+        if(symbol.section >= 8) { symbol.value = symbol.value + arrays.at(bases,symbol.section-1); symbol.section = 1 }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(O.relocations)) {
+        view mut var relocation = O.relocations[index]
+        if(relocation.section >= 8) { relocation.offset = relocation.offset + arrays.at(bases,relocation.section-1); relocation.section = 1 }
+        index = index + 1
+    }
+}
+fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[string] libraries, bool pie) {
     nativeFlattenLifecycle(O)
+    nativeFlattenLegacyCode(O)
     var array[string] functions = []
     var array[NativeSymbol] objects = []
     var libraryIndex = 0
@@ -471,9 +519,14 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         nativeLibraryExports(arrays.at(libraries,libraryIndex),functions,objects)
         libraryIndex = libraryIndex + 1
     }
+    var loader = "/lib64/ld-linux-x86-64.so.2"
+    if(sys.exists(loader) == false) { loader = "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" }
+    nativeLibraryExports(loader,functions,objects)
     var array[string] imports = []
     var array[int] importSymbols = []
     var array[int] dataSymbols = []
+    var array[int] dynamicData = []
+    var array[int] tlsImports = []
     var index = 0
     while(index < arrays.length(O.symbols)) {
         view mut var symbol = O.symbols[index]
@@ -481,15 +534,24 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
             if(symbol.name == "_GLOBAL_OFFSET_TABLE_") { index = index + 1; continue; }
             var objectIndex = 0
             while(objectIndex < arrays.length(objects) && objects[objectIndex].name != symbol.name) { objectIndex = objectIndex + 1 }
-            if(symbol.kind == 6 || (objectIndex < arrays.length(objects) && objects[objectIndex].kind == 6)) { throw "nanoc: native TLS imports are unsupported: " + copy(symbol.name) }
+            if(symbol.kind == 6 || (objectIndex < arrays.length(objects) && objects[objectIndex].kind == 6)) {
+                if(objectIndex == arrays.length(objects) || objects[objectIndex].kind != 6) { throw "nanoc: unresolved/mismatched TLS symbol " + copy(symbol.name) }
+                symbol.section = -4; symbol.kind = 6; arrays.push(tlsImports,index)
+                index = index + 1; continue
+            }
             if(objectIndex < arrays.length(objects)) {
                 view var provider = objects[objectIndex]
-                if(provider.visibility == 3) { throw "nanoc: protected data imports cannot use copy relocations: " + copy(symbol.name) }
+
                 if(symbol.kind == 2) { throw "nanoc: function import resolves to a data symbol: " + copy(symbol.name) }
                 if(provider.size <= 0 || provider.size > 16777216) { throw "nanoc: unsupported native data import size: " + copy(symbol.name) }
-                // ET_EXEC copy relocation gives native direct references and the
-                // DSO a single preemptible storage location. Protected/TLS data
-                // cannot obey this rule and is rejected above.
+                if(pie || provider.visibility == 3) {
+                    symbol.section = -3; symbol.kind = 1; symbol.size = provider.size
+                    arrays.push(dynamicData,index)
+                    index = index + 1; continue
+                }
+                // Fixed ET_EXEC copy relocation gives native direct references and the
+                // DSO a single preemptible storage location. Protected data
+                // and PIE use runtime GOT/pointer relocations instead.
                 view mut var data = O.sections[1]
                 binaryAlign(data.bytes,provider.value)
                 if(provider.value > data.alignment) { data.alignment = provider.value }
@@ -549,18 +611,38 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         binaryAppend(rela.bytes,0,8); binaryAppend(rela.bytes,((index + 1) << 32) | 6,8); binaryAppend(rela.bytes,0,8)
         index = index + 1
     }
+    var array[int] dynamicIndices = []
+    index = 0
+    while(index < arrays.length(O.symbols)) { arrays.push(dynamicIndices,0); index = index + 1 }
+    index = 0
+    while(index < arrays.length(dynamicData)) {
+        view var symbol = O.symbols[arrays.at(dynamicData,index)]
+        dynamicIndices[arrays.at(dynamicData,index)] = arrays.length(dynsym.bytes) / 24
+        var binding = 1
+        if(symbol.weak) { binding = 2 }
+        nativeSymbolEntry(dynsym.bytes,nativeString(dynstr.bytes,symbol.name),binding,1,0,0,symbol.size)
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(tlsImports)) {
+        view var symbol = O.symbols[arrays.at(tlsImports,index)]
+        dynamicIndices[arrays.at(tlsImports,index)] = arrays.length(dynsym.bytes) / 24
+        nativeSymbolEntry(dynsym.bytes,nativeString(dynstr.bytes,symbol.name),symbol.weak ? 2 : 1,6,0,0,0)
+        index = index + 1
+    }
     var array[int] exportSymbols = []
     var array[int] exportIndices = []
     index = 0
     while(index < arrays.length(O.symbols)) {
         view var symbol = O.symbols[index]
-        if(symbol.global && symbol.section != 0 && arrays.index_of(importSymbols,index) < 0) {
+        if(symbol.global && symbol.section != 0 && symbol.section != -3 && symbol.section != -4 && arrays.index_of(importSymbols,index) < 0) {
             var dynamicIndex = arrays.length(dynsym.bytes) / 24
             var binding = 1
             if(symbol.weak) { binding = 2 }
             var section = 0
-            if(symbol.section == -1) { section = 65521 } else if(symbol.section == 1) { section = 2 } else if(symbol.section == 2) { section = 8 } else if(symbol.section == 3) { section = 3 } else { throw "nanoc: invalid exported symbol section" }
+            if(symbol.section == -1) { section = 65521 } else if(symbol.section == 1) { section = 2 } else if(symbol.section == 2) { section = 8 } else if(symbol.section == 3) { section = 3 } else if(symbol.section == 7) { section = 14 } else { throw "nanoc: invalid exported symbol section" }
             arrays.push(exportSymbols,index); arrays.push(exportIndices,dynamicIndex)
+            dynamicIndices[index] = dynamicIndex
             nativeSymbolEntry(dynsym.bytes,nativeString(dynstr.bytes,symbol.name),binding,symbol.kind,section,0,symbol.size)
             if(arrays.index_of(dataSymbols,index) >= 0) {
                 binaryAppend(rela.bytes,0,8); binaryAppend(rela.bytes,(dynamicIndex << 32) | 5,8); binaryAppend(rela.bytes,0,8)
@@ -589,6 +671,65 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         }
         index = index + 1
     }
+    var array[int] tlsSlots = []
+    var array[int] tlsSlotKinds = []
+    index = 0
+    while(index < arrays.length(O.symbols) * 4) { arrays.push(tlsSlots,-1); arrays.push(tlsSlotKinds,0); index = index + 1 }
+    index = 0
+    while(index < arrays.length(O.relocations)) {
+        view var relocation = O.relocations[index]
+        if(relocation.kind == 19 || relocation.kind == 20 || relocation.kind == 22 || relocation.kind == 34) {
+            var si = 0
+            while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
+            if(si == arrays.length(O.symbols) || O.symbols[si].kind != 6) { throw "nanoc: TLS relocation requires TLS symbol" }
+            var key = nativeTlsSlotKey(si,relocation.kind)
+            if(arrays.at(tlsSlots,key) < 0) {
+                tlsSlots[key] = arrays.length(got.bytes); tlsSlotKinds[key] = relocation.kind
+                binaryAppend(got.bytes,0,8)
+                if(relocation.kind != 22) { binaryAppend(got.bytes,0,8) }
+            }
+        }
+        index = index + 1
+    }
+    var runtimeRelaStart = arrays.length(rela.bytes)
+    var runtimeCount = 0
+    index = 0
+    while(index < arrays.length(tlsSlots)) {
+        if(arrays.at(tlsSlots,index) >= 0) { runtimeCount = runtimeCount + (arrays.at(tlsSlotKinds,index) == 19 ? 2 : 1) }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(gotSlots)) {
+        if(arrays.at(gotSlots,index) >= 0 && (O.symbols[index].section == -3 || (pie && O.symbols[index].section != -1))) { runtimeCount = runtimeCount + 1 }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(O.relocations)) {
+        view var relocation = O.relocations[index]
+        var si = 0
+        while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
+        if(si == arrays.length(O.symbols)) { throw "nanoc: missing relocation symbol" }
+        view var symbol = O.symbols[si]
+        if((relocation.kind >= 17 && relocation.kind <= 23 || relocation.kind == 34 || relocation.kind == 35) && symbol.kind != 6) { throw "nanoc: TLS relocation requires TLS symbol" }
+        if(symbol.kind == 6 && (nativeGotRelocation(relocation.kind) || relocation.kind == 1 || relocation.kind == 2 || relocation.kind == 4 || relocation.kind == 10 || relocation.kind == 11)) { throw "nanoc: TLS requires TLS-specific relocations" }
+        if(relocation.kind == 16) { throw "nanoc: input DTPMOD64 relocations require a dynamic TLS descriptor" }
+        if(relocation.kind == 18 && symbol.section != 7) { throw "nanoc: static TPOFF64 requires executable TLS definition" }
+        if(relocation.kind == 20 && symbol.section == -4) { throw "nanoc: local-dynamic TLS requires a local module definition" }
+        if(relocation.kind == 23 && symbol.section != 7) { throw "nanoc: local-exec TLS requires executable TLS definition" }
+        if(relocation.kind == 35) {
+            if(symbol.kind != 6 || arrays.at(tlsSlots,nativeTlsSlotKey(si,35)) < 0) { throw "nanoc: TLS descriptor call lacks matching descriptor" }
+            index = index + 1; continue
+        }
+        if(relocation.kind == 1 && (symbol.section == -3 || (pie && symbol.section != -1))) {
+            if(relocation.section != 2 && relocation.section != 7) { throw "nanoc: PIE/runtime absolute relocations require writable data/TLS templates (text relocations are unsupported)" }
+            runtimeCount = runtimeCount + 1
+        }
+        if(pie && (relocation.kind == 10 || relocation.kind == 11) && symbol.section != -1) { throw "nanoc: PIE requires position-independent input for 32-bit absolute relocations" }
+        if(pie && (relocation.kind == 2 || relocation.kind == 4) && symbol.section == -1) { throw "nanoc: PIE PC-relative relocation to absolute symbol is unsupported" }
+        index = index + 1
+    }
+    index = 0
+    while(index < (runtimeCount + (pie ? arrays.length(O.lifecycle) : 0)) * 24) { arrays.push(rela.bytes,0); index = index + 1 }
     binaryAppend(hash.bytes,1,4); binaryAppend(hash.bytes,arrays.length(dynsym.bytes) / 24,4)
     var first = 0
     if(arrays.length(dynsym.bytes) > 24) { first = 1 }
@@ -617,28 +758,32 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         index = index + 1
     }
     var names = NativeSection(".shstrtab",0); names.kind = 3; names.bytes = [0]
+    arrays.push(sections,copy(O.sections[6]))
     arrays.push(sections,names)
     var array[int] nameOffsets = []
     index = 0
     while(index < arrays.length(sections)) { arrays.push(nameOffsets,nativeString(names.bytes,sections[index].name)); index = index + 1 }
     var baseAddress = 4194304
+    if(pie) { baseAddress = 0 }
     var array[int] bytes = []
-    nativeHeader(bytes,2,0,64,0,6,15,14)
-    // Reserve the six program headers.
+    var elfKind = 2
+    if(pie) { elfKind = 3 }
+    nativeHeader(bytes,elfKind,0,64,0,7,16,15)
+    // Reserve seven program headers, including the executable TLS template.
     index = 0
-    while(index < 336) { arrays.push(bytes,0); index = index + 1 }
+    while(index < 392) { arrays.push(bytes,0); index = index + 1 }
     var array[int] offsets = []
     index = 0
     var readSize = 0
     var writeOffset = 0
-    while(index < 13) {
+    while(index < 14) {
         view var section = sections[index]
         if(index == 7) { readSize = arrays.length(bytes); binaryAlign(bytes,4096); writeOffset = arrays.length(bytes) }
         binaryAlign(bytes,section.alignment)
         arrays.push(offsets,arrays.length(bytes))
         // .dynamic is populated below, with fixed size computed from tag count.
         if(index == 9) {
-            var size = (arrays.length(needed) + 16) * 16
+            var size = (arrays.length(needed) + 17 + (O.initOffset >= 0 ? 1 : 0) + (O.finiOffset >= 0 ? 1 : 0)) * 16
             var bi = 0
             while(bi < size) { arrays.push(bytes,0); bi = bi + 1 }
         } else { nativeConcat(bytes,section.bytes) }
@@ -646,6 +791,9 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     }
     var writeSize = arrays.length(bytes) - writeOffset
     var array[int] sectionAddresses = [baseAddress + arrays.at(offsets,1),baseAddress + arrays.at(offsets,7),baseAddress + arrays.at(offsets,2)]
+    var tlsSize = arrays.length(O.sections[6].bytes)
+    var tlsAlignment = O.sections[6].alignment
+    var tlsBlockSize = ((tlsSize + tlsAlignment - 1) / tlsAlignment) * tlsAlignment
     index = 0
     while(index < arrays.length(imports)) {
         var stub = arrays.at(stubs,index)
@@ -660,7 +808,8 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     index = 0
     while(index < arrays.length(exportSymbols)) {
         view var symbol = O.symbols[arrays.at(exportSymbols,index)]
-        var address = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
+        var address = symbol.value
+        if(symbol.kind != 6) { address = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8)) }
         binaryPatch(bytes,arrays.at(offsets,4) + arrays.at(exportIndices,index) * 24 + 8,address,8)
         index = index + 1
     }
@@ -670,13 +819,49 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         binaryPatch(bytes,arrays.at(offsets,6) + (arrays.length(imports) + index) * 24,nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8)),8)
         index = index + 1
     }
+    var array[int] runtimeRelas = []
+    index = 0
+    while(index < arrays.length(tlsSlots)) {
+        var slot = arrays.at(tlsSlots,index)
+        if(slot >= 0) {
+            view var symbol = O.symbols[index / 4]
+            var model = arrays.at(tlsSlotKinds,index)
+            var dynamicIndex = arrays.at(dynamicIndices,index / 4)
+            var location = baseAddress + arrays.at(offsets,8) + slot
+            if(model == 34) {
+                binaryAppend(runtimeRelas,location,8); binaryAppend(runtimeRelas,(dynamicIndex << 32) | 36,8); binaryAppend(runtimeRelas,(dynamicIndex == 0 ? symbol.value : 0),8)
+            } else if(model == 22) {
+                binaryAppend(runtimeRelas,location,8); binaryAppend(runtimeRelas,(dynamicIndex << 32) | 18,8); binaryAppend(runtimeRelas,(dynamicIndex == 0 ? symbol.value : 0),8)
+            } else {
+                // Executable's TLS module ID is fixed at one for local symbols.
+                if(symbol.section == 7) { binaryPatch(bytes,arrays.at(offsets,8) + slot,1,8) }
+                binaryAppend(runtimeRelas,location,8); binaryAppend(runtimeRelas,(symbol.section == 7 ? 0 : dynamicIndex) << 32 | 16,8); binaryAppend(runtimeRelas,0,8)
+                if(model == 19) {
+                    if(symbol.section == 7 && dynamicIndex == 0) {
+                        binaryAppend(runtimeRelas,location + 8,8); binaryAppend(runtimeRelas,17,8); binaryAppend(runtimeRelas,symbol.value,8)
+                    } else {
+                        binaryAppend(runtimeRelas,location + 8,8); binaryAppend(runtimeRelas,(dynamicIndex << 32) | 17,8); binaryAppend(runtimeRelas,0,8)
+                    }
+                }
+            }
+        }
+        index = index + 1
+    }
     index = 0
     while(index < arrays.length(gotSlots)) {
         var slot = arrays.at(gotSlots,index)
         if(slot >= 0) {
             view var symbol = O.symbols[index]
-            var address = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
-            binaryPatch(bytes,arrays.at(offsets,8) + slot,address,8)
+            var location = arrays.at(offsets,8) + slot
+            if(symbol.section == -3) {
+                binaryAppend(runtimeRelas,baseAddress + location,8); binaryAppend(runtimeRelas,(arrays.at(dynamicIndices,index) << 32) | 6,8); binaryAppend(runtimeRelas,0,8)
+            } else {
+                var address = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
+                binaryPatch(bytes,location,address,8)
+                if(pie && symbol.section != -1) {
+                    binaryAppend(runtimeRelas,location,8); binaryAppend(runtimeRelas,8,8); binaryAppend(runtimeRelas,address,8)
+                }
+            }
         }
         index = index + 1
     }
@@ -687,7 +872,18 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
         if(si == arrays.length(O.symbols)) { throw "nanoc: missing native relocation symbol " + copy(relocation.symbol) }
         view var symbol = O.symbols[si]
-        var symbolAddress = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8))
+        if(relocation.kind == 35) {
+            if(symbol.kind != 6 || arrays.at(tlsSlots,nativeTlsSlotKey(si,35)) < 0) { throw "nanoc: TLS descriptor call lacks matching descriptor" }
+            index = index + 1; continue
+        }
+        var symbolAddress = 0
+        if(symbol.section != -3 && symbol.section != -4 && symbol.kind != 6) { symbolAddress = nativeSymbolAddress(symbol,sectionAddresses,baseAddress + arrays.at(offsets,8)) }
+        if(relocation.kind == 19 || relocation.kind == 20 || relocation.kind == 22 || relocation.kind == 34) { symbolAddress = baseAddress + arrays.at(offsets,8) + arrays.at(tlsSlots,nativeTlsSlotKey(si,relocation.kind)) }
+        if(relocation.kind == 21 || relocation.kind == 17) {
+            if(symbol.section != 7) { throw "nanoc: static DTPOFF requires local TLS" }
+            symbolAddress = symbol.value
+        }
+        if(relocation.kind == 23 || relocation.kind == 18) { symbolAddress = symbol.value - tlsBlockSize }
         if(relocation.kind == 26) { symbolAddress = baseAddress + arrays.at(offsets,8) }
         if(nativeGotRelocation(relocation.kind)) {
             if(arrays.at(gotSlots,si) < 0) { throw "nanoc: missing native GOT slot" }
@@ -696,24 +892,60 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         var sectionOffset = arrays.at(offsets,1)
         if(relocation.section == 2) { sectionOffset = arrays.at(offsets,7) }
         if(relocation.section == 3) { sectionOffset = arrays.at(offsets,2) }
+        if(relocation.section == 7) { sectionOffset = arrays.at(offsets,13) }
         var location = sectionOffset + relocation.offset
-        nativeApplyRelocation(bytes,location,relocation.kind,symbolAddress,relocation.addend,baseAddress + location)
+        if(relocation.kind == 1 && (symbol.section == -3 || (pie && symbol.section != -1))) {
+            var info = 8
+            if(symbol.section == -3) { info = (arrays.at(dynamicIndices,si) << 32) | 1 }
+            binaryAppend(runtimeRelas,baseAddress + location,8); binaryAppend(runtimeRelas,info,8); binaryAppend(runtimeRelas,symbolAddress + relocation.addend,8)
+            binaryPatch(bytes,location,0,8)
+        } else {
+            if(symbol.section == -3 && nativeGotRelocation(relocation.kind) == false) { throw "nanoc: protected/PIE data requires GOT or 64-bit pointer relocations: " + copy(symbol.name) }
+            var relocationKind = relocation.kind
+            if(relocationKind == 19 || relocationKind == 20 || relocationKind == 22 || relocationKind == 34) { relocationKind = 2 }
+            if(relocationKind == 21 || relocationKind == 23) { relocationKind = 11 }
+            if(relocationKind == 17 || relocationKind == 18) { relocationKind = 1 }
+            nativeApplyRelocation(bytes,location,relocationKind,symbolAddress,relocation.addend,baseAddress + location)
+        }
         index = index + 1
     }
+    var skippedLifecycle = 0
     index = 0
     while(index < 3) {
         view var order = lifecycleOrder[index]
         var oi = 0
+        var written = 0
         while(oi < arrays.length(order)) {
             view var entry = O.lifecycle[arrays.at(order,oi)]
             var functionAddress = binaryUnsigned(bytes,arrays.at(offsets,7) + entry.offset,8)
-            if(functionAddress == 0 || functionAddress == -1) { throw "nanoc: null/sentinel lifecycle pointer is unsupported" }
+            if(pie) {
+                var ri = 0
+                while(ri < arrays.length(runtimeRelas)) {
+                    if(binaryUnsigned(runtimeRelas,ri,8) == arrays.at(offsets,7) + entry.offset && binaryUnsigned(runtimeRelas,ri + 8,8) == 8) { functionAddress = binaryUnsigned(runtimeRelas,ri + 16,8); break; }
+                    ri = ri + 24
+                }
+            }
+            if(functionAddress == 0 || functionAddress == -1) {
+                if(entry.legacy) { skippedLifecycle = skippedLifecycle + 1; oi = oi + 1; continue; }
+                throw "nanoc: null/sentinel lifecycle pointer is unsupported"
+            }
             if(functionAddress < arrays.at(sectionAddresses,0) || functionAddress >= arrays.at(sectionAddresses,0) + arrays.length(O.sections[0].bytes)) { throw "nanoc: lifecycle pointer does not target executable code" }
-            binaryPatch(bytes,arrays.at(offsets,10 + index) + oi * 8,functionAddress,8)
+            var arrayLocation = arrays.at(offsets,10 + index) + written * 8
+            binaryPatch(bytes,arrayLocation,functionAddress,8)
+            if(pie) { binaryAppend(runtimeRelas,arrayLocation,8); binaryAppend(runtimeRelas,8,8); binaryAppend(runtimeRelas,functionAddress,8) }
+            written = written + 1
             oi = oi + 1
         }
+        sections[10 + index].bytes = arrays.slice(sections[10 + index].bytes,0,written * 8)
         index = index + 1
     }
+    if(pie) {
+        index = 0
+        while(index < skippedLifecycle) { binaryAppend(runtimeRelas,0,8); binaryAppend(runtimeRelas,0,8); binaryAppend(runtimeRelas,0,8); index = index + 1 }
+    }
+    if(arrays.length(runtimeRelas) != arrays.length(rela.bytes) - runtimeRelaStart) { throw "nanoc: inconsistent dynamic relocation layout" }
+    index = 0
+    while(index < arrays.length(runtimeRelas)) { bytes[arrays.at(offsets,6) + runtimeRelaStart + index] = arrays.at(runtimeRelas,index); index = index + 1 }
     libraryIndex = 0
     while(libraryIndex < arrays.length(needed)) { nativeDynamicEntry(dynamic.bytes,1,arrays.at(needed,libraryIndex)); libraryIndex = libraryIndex + 1 }
     nativeDynamicEntry(dynamic.bytes,4,baseAddress + arrays.at(offsets,3))
@@ -724,12 +956,15 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     nativeDynamicEntry(dynamic.bytes,7,baseAddress + arrays.at(offsets,6))
     nativeDynamicEntry(dynamic.bytes,8,arrays.length(rela.bytes))
     nativeDynamicEntry(dynamic.bytes,9,24)
+    if(O.initOffset >= 0) { nativeDynamicEntry(dynamic.bytes,12,arrays.at(sectionAddresses,0) + O.initOffset) }
+    if(O.finiOffset >= 0) { nativeDynamicEntry(dynamic.bytes,13,arrays.at(sectionAddresses,0) + O.finiOffset) }
     nativeDynamicEntry(dynamic.bytes,25,baseAddress + arrays.at(offsets,10))
     nativeDynamicEntry(dynamic.bytes,27,arrays.length(sections[10].bytes))
     nativeDynamicEntry(dynamic.bytes,26,baseAddress + arrays.at(offsets,11))
     nativeDynamicEntry(dynamic.bytes,28,arrays.length(sections[11].bytes))
     nativeDynamicEntry(dynamic.bytes,32,baseAddress + arrays.at(offsets,12))
     nativeDynamicEntry(dynamic.bytes,33,arrays.length(sections[12].bytes))
+    nativeDynamicEntry(dynamic.bytes,1879048187,pie ? 134217728 : 0)
     nativeDynamicEntry(dynamic.bytes,24,0)
     nativeDynamicEntry(dynamic.bytes,0,0)
     index = 0
@@ -737,11 +972,12 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     var entry = arrays.at(sectionAddresses,0) + O.symbols[start].value
     binaryPatch(bytes,24,entry,8)
     var array[int] programs = []
-    nativeProgramHeader(programs,6,4,64,baseAddress + 64,336,336,8)
+    nativeProgramHeader(programs,6,4,64,baseAddress + 64,392,392,8)
     nativeProgramHeader(programs,3,4,arrays.at(offsets,0),baseAddress + arrays.at(offsets,0),arrays.length(interp.bytes),arrays.length(interp.bytes),1)
     nativeProgramHeader(programs,1,5,0,baseAddress,readSize,readSize,4096)
     nativeProgramHeader(programs,1,6,writeOffset,baseAddress + writeOffset,writeSize,writeSize,4096)
     nativeProgramHeader(programs,2,6,arrays.at(offsets,9),baseAddress + arrays.at(offsets,9),arrays.length(dynamic.bytes),arrays.length(dynamic.bytes),8)
+    nativeProgramHeader(programs,7,4,arrays.at(offsets,13),baseAddress + arrays.at(offsets,13),tlsSize,tlsSize,tlsAlignment)
     nativeProgramHeader(programs,1685382481,6,0,0,0,0,16)
     index = 0
     while(index < arrays.length(programs)) { bytes[64 + index] = arrays.at(programs,index); index = index + 1 }
@@ -758,13 +994,13 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         if(index == 9) { link = 6; entrySize = 16 }
         if(index >= 10 && index <= 12) { entrySize = 8 }
         var address = 0
-        if(index < 13) { address = baseAddress + arrays.at(offsets,index) }
+        if(index < 14) { address = baseAddress + arrays.at(offsets,index) }
         nativeSectionHeader(bytes,arrays.at(nameOffsets,index),section.kind,section.flags,address,arrays.at(offsets,index),arrays.length(section.bytes),link,info,section.alignment,entrySize)
         index = index + 1
     }
     binaryWrite(path,bytes,true)
 }
-fun nativeLink(view mut NativeObject O, view string path, view array[string] libraries) {
+fun nativeLink(view mut NativeObject O, view string path, view array[string] libraries, bool pie) {
     var index = 0
     while(index < arrays.length(O.symbols)) {
         if(O.symbols[index].name == "_start" && O.symbols[index].section != 0) { throw "nanoc: _start is reserved by native startup" }
@@ -773,5 +1009,5 @@ fun nativeLink(view mut NativeObject O, view string path, view array[string] lib
     var startup = nativeAssemble(".text\n.globl _start\n.type _start, @function\n_start:\nxorl %ebp, %ebp\nmovq %rdx, %r9\npopq %rsi\nmovq %rsp, %rdx\nandq $-16, %rsp\npushq %rax\npushq %rsp\nxorl %r8d, %r8d\nxorl %ecx, %ecx\nleaq main(%rip), %rdi\ncall __libc_start_main\nhlt\n")
     nativeMerge(O,startup,-1)
     nativeAllocateCommon(O)
-    nativeWriteExecutable(O,path,libraries)
+    nativeWriteExecutable(O,path,libraries,pie)
 }

@@ -18,7 +18,8 @@ class NativeSection {
 }
 class NativeSymbol {
     var string name
-    // Linker tags: 0 = undefined, -1 = absolute, -2 = pending common.
+    // Linker tags: 0 = undefined, -1 = absolute, -2 = pending common,
+    // -3 = runtime ordinary data import, -4 = runtime TLS import.
     // Positive values index NativeObject.sections (one-based).
     var int section
     var int value
@@ -56,8 +57,9 @@ class NativeLifecycle {
     var int section
     var int offset
     var int priority
+    var bool legacy
     fun init(int section, int offset, int priority) {
-        this.section = section; this.offset = offset; this.priority = priority
+        this.section = section; this.offset = offset; this.priority = priority; this.legacy = false
     }
 }
 class NativeObject {
@@ -67,16 +69,22 @@ class NativeObject {
     var int current
     var array[NativeLifecycle] lifecycle
     var int lifecyclePriority
+    var bool lifecycleLegacy
+    var int initOffset
+    var int finiOffset
     fun init() {
-        this.sections = [NativeSection(".text", 6), NativeSection(".data", 3), NativeSection(".rodata", 2), NativeSection(".init_array", 3), NativeSection(".fini_array", 3), NativeSection(".preinit_array", 3)]
+        this.sections = [NativeSection(".text", 6), NativeSection(".data", 3), NativeSection(".rodata", 2), NativeSection(".init_array", 3), NativeSection(".fini_array", 3), NativeSection(".preinit_array", 3), NativeSection(".tdata", 1027), NativeSection(".init",6), NativeSection(".fini",6)]
         this.symbols = []
         this.relocations = []
         this.current = 1
         this.lifecycle = []
         this.lifecyclePriority = 65535
+        this.lifecycleLegacy = false
+        this.initOffset = -1; this.finiOffset = -1
         this.sections[3].kind = 14; this.sections[3].alignment = 8
         this.sections[4].kind = 15; this.sections[4].alignment = 8
         this.sections[5].kind = 16; this.sections[5].alignment = 8
+        this.sections[6].alignment = 8
     }
 }
 class NativeOperand {
@@ -86,7 +94,8 @@ class NativeOperand {
     var int base
     var int displacement
     var string symbol
-    fun init() { this.kind = ""; this.reg = 0; this.width = 0; this.base = -1; this.displacement = 0; this.symbol = "" }
+    var int relocation
+    fun init() { this.kind = ""; this.reg = 0; this.width = 0; this.base = -1; this.displacement = 0; this.symbol = ""; this.relocation = 2 }
 }
 
 fun nativeSymbol(view mut NativeObject O, view string name) -> int {
@@ -193,6 +202,10 @@ fun nativeOperand(view string spelling) -> NativeOperand {
         if(base == "%rip") { operand.base = -2 } else { operand.base = nativeRegister(base).reg }
         prefix = strings.substring(copy(text),0,open)
     }
+    var tls = strings.index_of(copy(prefix),"@TLSGD",0)
+    if(tls >= 0) { operand.relocation = 19; prefix = strings.substring(copy(prefix),0,tls) + strings.substring(copy(prefix),tls + 6,strings.length(copy(prefix))) }
+    var got = strings.index_of(copy(prefix),"@GOTPCREL",0)
+    if(got >= 0) { operand.relocation = 9; prefix = strings.substring(copy(prefix),0,got) + strings.substring(copy(prefix),got + 9,strings.length(copy(prefix))) }
     if(prefix != "") {
         var first = strings.substring(copy(prefix),0,1)
         if(first == "-" || (strings.char_code(copy(prefix),0) >= 48 && strings.char_code(copy(prefix),0) <= 57)) { operand.displacement = nativeConstant(prefix) } else { var expression = nativeExpression(prefix); operand.symbol = copy(expression.symbol); operand.displacement = expression.displacement }
@@ -211,7 +224,7 @@ fun nativeModRM(view mut NativeObject O, int reg, view NativeOperand rm, int tra
     if(rm.kind == "register" || rm.kind == "xmm") { nativeByte(O,192 | ((reg & 7) << 3) | (rm.reg & 7)); return; }
     if(rm.base == -2) {
         nativeByte(O,((reg & 7) << 3) | 5)
-        if(rm.symbol != "") { nativeRelocate(O,rm.symbol,2,rm.displacement - 4 - trailing,4) } else { nativeWord(O,rm.displacement,4) }
+        if(rm.symbol != "") { nativeRelocate(O,rm.symbol,rm.relocation,rm.displacement - 4 - trailing,4) } else { nativeWord(O,rm.displacement,4) }
         return
     }
     if(rm.symbol != "") { throw "nanoc: unsupported native base-relative symbol relocation" }
@@ -452,8 +465,8 @@ fun nativeInstruction(view mut NativeObject O, view string mnemonic, view array[
 }
 
 fun nativeLifecycleSection(view string name) -> int {
-    if(name == ".init_array" || strings.starts_with(copy(name),".init_array.")) { return 4 }
-    if(name == ".fini_array" || strings.starts_with(copy(name),".fini_array.")) { return 5 }
+    if(name == ".init_array" || strings.starts_with(copy(name),".init_array.") || name == ".ctors" || strings.starts_with(copy(name),".ctors.")) { return 4 }
+    if(name == ".fini_array" || strings.starts_with(copy(name),".fini_array.") || name == ".dtors" || strings.starts_with(copy(name),".dtors.")) { return 5 }
     if(name == ".preinit_array" || strings.starts_with(copy(name),".preinit_array.")) { return 6 }
     return 0
 }
@@ -462,6 +475,8 @@ fun nativeLifecyclePriority(view string name) -> int {
     var prefix = ".init_array"
     if(section == 5) { prefix = ".fini_array" }
     if(section == 6) { prefix = ".preinit_array" }
+    var legacy = strings.starts_with(copy(name),".ctors") || strings.starts_with(copy(name),".dtors")
+    if(legacy) { prefix = ".ctors"; if(section == 5) { prefix = ".dtors" } }
     if(name == prefix) { return 65535 }
     var digits = strings.substring(copy(name),strings.length(copy(prefix)) + 1,strings.length(copy(name)))
     if(digits == "") { throw "nanoc: empty lifecycle section priority" }
@@ -472,6 +487,7 @@ fun nativeLifecyclePriority(view string name) -> int {
         if(digit < 0 || digit > 9 || priority > (65535 - digit) / 10) { throw "nanoc: invalid lifecycle section priority" }
         priority = priority * 10 + digit; index = index + 1
     }
+    if(legacy) { return 65535 - priority }
     return priority
 }
 fun nativeAssemble(view string assembly) -> NativeObject {
@@ -501,7 +517,10 @@ fun nativeAssemble(view string assembly) -> NativeObject {
                 var sectionParts = nativeParts(arguments)
                 var name = copy(arrays.at(sectionParts,0))
                 var lifecycle = nativeLifecycleSection(name)
-                if(lifecycle != 0) { O.current = lifecycle; O.lifecyclePriority = nativeLifecyclePriority(name); continue; }
+                if(lifecycle != 0) { O.current = lifecycle; O.lifecyclePriority = nativeLifecyclePriority(name); O.lifecycleLegacy = strings.starts_with(copy(name),".ctors") || strings.starts_with(copy(name),".dtors"); continue; }
+                if(name == ".tdata") { O.current = 7; continue; }
+                if(name == ".init") { O.current = 8; continue; }
+                if(name == ".fini") { O.current = 9; continue; }
                 if(arguments == ".rodata") { O.current = 3; continue; }
                 if(strings.starts_with(copy(arguments),".note.GNU-stack")) { continue }
                 throw "unsupported native section " + arguments
@@ -515,7 +534,7 @@ fun nativeAssemble(view string assembly) -> NativeObject {
             }
             if(mnemonic == ".type") {
                 view mut var symbol = O.symbols[nativeSymbol(O,arrays.at(parts,0))]
-                if(arrays.at(parts,1) == "@function") { symbol.kind = 2 } else if(arrays.at(parts,1) == "@object") { symbol.kind = 1 } else { throw "unsupported native symbol type" }
+                if(arrays.at(parts,1) == "@tls_object") { symbol.kind = 6 } else if(arrays.at(parts,1) == "@function") { symbol.kind = 2 } else if(arrays.at(parts,1) == "@object") { symbol.kind = 1 } else { throw "unsupported native symbol type" }
                 continue
             }
             if(mnemonic == ".size") {
@@ -557,9 +576,11 @@ fun nativeAssemble(view string assembly) -> NativeObject {
                 if(mnemonic == ".quad") { width = 8 }
                 var index = 0
                 while(index < arrays.length(parts)) {
-                    if(O.current >= 4) {
+                    if(O.current >= 4 && O.current <= 6) {
                         if(width != 8 || nativeOffset(O) % 8 != 0) { throw "nanoc: lifecycle arrays require aligned 64-bit pointers" }
-                        arrays.push(O.lifecycle,NativeLifecycle(O.current,nativeOffset(O),O.lifecyclePriority))
+                        var entry = NativeLifecycle(O.current,nativeOffset(O),O.lifecyclePriority)
+                        entry.legacy = O.lifecycleLegacy
+                        arrays.push(O.lifecycle,entry)
                     }
                     var expression = nativeExpression(arrays.at(parts,index))
                     if(expression.symbol == "") { nativeWord(O,expression.displacement,width) } else if(width == 8) { nativeRelocate(O,expression.symbol,1,expression.displacement,8) } else if(width == 4) { nativeRelocate(O,expression.symbol,10,expression.displacement,4) } else { throw "unsupported native data relocation width" }
@@ -624,6 +645,8 @@ fun nativeObjectForWrite(view NativeObject source) -> NativeObject {
     W.sections = []
     var index = 0
     while(index < 3) { arrays.push(W.sections,copy(source.sections[index])); index = index + 1 }
+    index = 6
+    while(index < arrays.length(source.sections)) { arrays.push(W.sections,copy(source.sections[index])); index = index + 1 }
     var array[int] targetSections = []
     var array[int] targetOffsets = []
     index = 0
@@ -646,7 +669,7 @@ fun nativeObjectForWrite(view NativeObject source) -> NativeObject {
     index = 0
     while(index < arrays.length(source.symbols)) {
         var symbol = copy(source.symbols[index])
-        if(symbol.section >= 4) {
+        if(symbol.section >= 7) { symbol.section = symbol.section - 3 } else if(symbol.section >= 4) {
             var li = 0
             while(li < arrays.length(source.lifecycle) && (source.lifecycle[li].section != symbol.section || source.lifecycle[li].offset != symbol.value)) { li = li + 1 }
             if(li == arrays.length(source.lifecycle) || symbol.size > 8) { throw "nanoc: unsupported lifecycle symbol range" }
@@ -658,7 +681,7 @@ fun nativeObjectForWrite(view NativeObject source) -> NativeObject {
     index = 0
     while(index < arrays.length(source.relocations)) {
         var relocation = copy(source.relocations[index])
-        if(relocation.section >= 4) {
+        if(relocation.section >= 7) { relocation.section = relocation.section - 3 } else if(relocation.section >= 4) {
             var li = 0
             while(li < arrays.length(source.lifecycle) && (source.lifecycle[li].section != relocation.section || source.lifecycle[li].offset != relocation.offset)) { li = li + 1 }
             if(li == arrays.length(source.lifecycle) || relocation.kind != 1) { throw "nanoc: lifecycle arrays require 64-bit pointer relocations" }
