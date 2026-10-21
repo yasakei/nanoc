@@ -1,0 +1,635 @@
+use "binary.nt"
+use "pp.nt"
+use "ctype.nt"
+
+class NativeSection {
+    var string name
+    var array[int] bytes
+    var int alignment
+    var int flags
+    var int kind
+    fun init(string name, int flags) {
+        this.name = name
+        this.bytes = []
+        this.alignment = 1
+        this.flags = flags
+        this.kind = 1
+    }
+}
+class NativeSymbol {
+    var string name
+    var int section
+    var int value
+    var int size
+    var bool global
+    var int kind
+    fun init(string name) {
+        this.name = name
+        this.section = 0
+        this.value = 0
+        this.size = 0
+        this.global = false
+        this.kind = 0
+    }
+}
+class NativeRelocation {
+    var int section
+    var int offset
+    var string symbol
+    var int kind
+    var int addend
+    fun init(int section, int offset, string symbol, int kind, int addend) {
+        this.section = section
+        this.offset = offset
+        this.symbol = symbol
+        this.kind = kind
+        this.addend = addend
+    }
+}
+class NativeObject {
+    var array[NativeSection] sections
+    var array[NativeSymbol] symbols
+    var array[NativeRelocation] relocations
+    var int current
+    fun init() {
+        this.sections = [NativeSection(".text", 6), NativeSection(".data", 3), NativeSection(".rodata", 2)]
+        this.symbols = []
+        this.relocations = []
+        this.current = 1
+    }
+}
+class NativeOperand {
+    var string kind
+    var int reg
+    var int width
+    var int base
+    var int displacement
+    var string symbol
+    fun init() { this.kind = ""; this.reg = 0; this.width = 0; this.base = -1; this.displacement = 0; this.symbol = "" }
+}
+
+fun nativeSymbol(view mut NativeObject O, view string name) -> int {
+    var index = 0
+    while(index < arrays.length(O.symbols)) {
+        if (O.symbols[index].name == name) { return index }
+        index = index + 1
+    }
+    arrays.push(O.symbols,NativeSymbol(copy(name)))
+    return arrays.length(O.symbols) - 1
+}
+fun nativeByte(view mut NativeObject O, int value) {
+    view mut var section = O.sections[O.current - 1]
+    arrays.push(section.bytes,value & 255)
+}
+fun nativeWord(view mut NativeObject O, int value, int width) {
+    var index = 0
+    while(index < width) { nativeByte(O,(value >> (index * 8)) & 255); index = index + 1 }
+}
+fun nativeOffset(view NativeObject O) -> int { return arrays.length(O.sections[O.current - 1].bytes) }
+fun nativeRelocate(view mut NativeObject O, view string symbol, int kind, int addend, int width) {
+    if(symbol == "") { throw "empty relocation at emission" }
+    nativeSymbol(O,symbol)
+    arrays.push(O.relocations, NativeRelocation(O.current,nativeOffset(O),copy(symbol),kind,addend))
+    nativeWord(O,0,width)
+}
+fun nativeParts(view string text) -> array[string] {
+    var array[string] parts = []
+    var start = 0
+    var depth = 0
+    var index = 0
+    while(index < strings.length(copy(text))) {
+        var ch = strings.substring(copy(text),index,index + 1)
+        if(ch == "(") { depth = depth + 1 }
+        if(ch == ")") { depth = depth - 1 }
+        if(ch == "," && depth == 0) {
+            arrays.push(parts,strings.trim(strings.substring(copy(text),start,index)))
+            start = index + 1
+        }
+        index = index + 1
+    }
+    if(start < strings.length(copy(text))) { arrays.push(parts,strings.trim(strings.substring(copy(text),start,strings.length(copy(text))))) }
+    return parts
+}
+fun nativeConstant(view string text) -> int {
+    if(text == "-9223372036854775808") { return -9223372036854775807 - 1 }
+    var array[Token] tokens = []
+    lex(copy(text),tokens)
+    var C = Cur(tokens)
+    var value = evExpr(C)
+    if(C.peek().kind != "eo") { throw "nanoc: invalid assembler constant " + copy(text) }
+    return value
+}
+fun nativeRegister(view string name) -> NativeOperand {
+    var operand = NativeOperand()
+    operand.kind = "register"
+    var array[string] q = ["%rax","%rcx","%rdx","%rbx","%rsp","%rbp","%rsi","%rdi"]
+    var array[string] l = ["%eax","%ecx","%edx","%ebx","%esp","%ebp","%esi","%edi"]
+    var array[string] w = ["%ax","%cx","%dx","%bx","%sp","%bp","%si","%di"]
+    var array[string] b = ["%al","%cl","%dl","%bl","%spl","%bpl","%sil","%dil"]
+    var index = arrays.index_of(q,name)
+    if(index >= 0) { operand.reg = index; operand.width = 8; return operand }
+    index = arrays.index_of(l,name)
+    if(index >= 0) { operand.reg = index; operand.width = 4; return operand }
+    index = arrays.index_of(w,name)
+    if(index >= 0) { operand.reg = index; operand.width = 2; return operand }
+    index = arrays.index_of(b,name)
+    if(index >= 0) { operand.reg = index; operand.width = 1; return operand }
+    if(strings.starts_with(copy(name),"%xmm")) {
+        operand.kind = "xmm"
+        operand.reg = fmt.to_int(strings.substring(copy(name),4,strings.length(copy(name))))
+        operand.width = 8
+        return operand
+    }
+    if(strings.starts_with(copy(name),"%r")) {
+        var number = strings.substring(copy(name),2,strings.length(copy(name)))
+        var last = strings.substring(copy(number),strings.length(copy(number)) - 1,strings.length(copy(number)))
+        operand.width = 8
+        if(last == "b" || last == "w" || last == "d") {
+            if(last == "b") { operand.width = 1 }
+            if(last == "w") { operand.width = 2 }
+            if(last == "d") { operand.width = 4 }
+            number = strings.substring(copy(number),0,strings.length(copy(number)) - 1)
+        }
+        operand.reg = fmt.to_int(number)
+        if(operand.reg >= 8 && operand.reg <= 15) { return operand }
+    }
+    throw "nanoc: unsupported register " + copy(name)
+}
+fun nativeOperand(view string spelling) -> NativeOperand {
+    var text = strings.trim(copy(spelling))
+    if(strings.starts_with(copy(text),"%")) { return nativeRegister(text) }
+    var operand = NativeOperand()
+    if(strings.starts_with(copy(text),"$")) {
+        operand.kind = "immediate"
+        operand.displacement = nativeConstant(strings.substring(copy(text),1,strings.length(copy(text))))
+        return operand
+    }
+    operand.kind = "memory"
+    var open = strings.index_of(copy(text),"(",0)
+    var prefix = copy(text)
+    if(open >= 0) {
+        var base = strings.substring(copy(text),open + 1,strings.length(copy(text)) - 1)
+        if(base == "%rip") { operand.base = -2 } else { operand.base = nativeRegister(base).reg }
+        prefix = strings.substring(copy(text),0,open)
+    }
+    if(prefix != "") {
+        var first = strings.substring(copy(prefix),0,1)
+        if(first == "-" || (strings.char_code(copy(prefix),0) >= 48 && strings.char_code(copy(prefix),0) <= 57)) { operand.displacement = nativeConstant(prefix) } else { var expression = nativeExpression(prefix); operand.symbol = copy(expression.symbol); operand.displacement = expression.displacement }
+    }
+    return operand
+}
+fun nativeRex(view mut NativeObject O, int width, int reg, view NativeOperand rm, bool byteRex) {
+    if(width == 2) { nativeByte(O,102) }
+    var rex = 64
+    if(width == 8) { rex = rex | 8 }
+    if(reg >= 8) { rex = rex | 4 }
+    if(rm.kind == "register" || rm.kind == "xmm") { if(rm.reg >= 8) { rex = rex | 1 } } else if(rm.base >= 8) { rex = rex | 1 }
+    if(rex != 64 || byteRex) { nativeByte(O,rex) }
+}
+fun nativeModRM(view mut NativeObject O, int reg, view NativeOperand rm, int trailing) {
+    if(rm.kind == "register" || rm.kind == "xmm") { nativeByte(O,192 | ((reg & 7) << 3) | (rm.reg & 7)); return; }
+    if(rm.base == -2) {
+        nativeByte(O,((reg & 7) << 3) | 5)
+        if(rm.symbol != "") { nativeRelocate(O,rm.symbol,2,rm.displacement - 4 - trailing,4) } else { nativeWord(O,rm.displacement,4) }
+        return
+    }
+    if(rm.symbol != "") { throw "nanoc: unsupported native base-relative symbol relocation" }
+    if(rm.base < 0) { throw "nanoc: absolute memory operand is not supported" }
+    var mod = 0
+    if(rm.displacement != 0 || (rm.base & 7) == 5) {
+        if(rm.displacement >= -128 && rm.displacement <= 127) { mod = 1 } else { mod = 2 }
+    }
+    var base = rm.base & 7
+    nativeByte(O,(mod << 6) | ((reg & 7) << 3) | base)
+    if(base == 4) { nativeByte(O,36) }
+    if(mod == 1) { nativeWord(O,rm.displacement,1) }
+    if(mod == 2) { nativeWord(O,rm.displacement,4) }
+}
+fun nativeRM(view mut NativeObject O, int opcode, int width, int reg, view NativeOperand rm, bool escaped, int trailing) {
+    var byteRex = width == 1 && (reg >= 4 || (rm.kind == "register" && rm.reg >= 4))
+    nativeRex(O,width,reg,rm,byteRex)
+    if(escaped) { nativeByte(O,15) }
+    nativeByte(O,opcode)
+    nativeModRM(O,reg,rm,trailing)
+}
+fun nativeSse(view mut NativeObject O, int prefix, int opcode, int width, int reg, view NativeOperand rm) {
+    if(prefix != 0) { nativeByte(O,prefix) }
+    nativeRex(O,width,reg,rm,false)
+    nativeByte(O,15)
+    nativeByte(O,opcode)
+    nativeModRM(O,reg,rm,0)
+}
+fun nativeCondition(view string suffix) -> int {
+    if(suffix == "o") { return 0 }
+    if(suffix == "no") { return 1 }
+    if(suffix == "b" || suffix == "c") { return 2 }
+    if(suffix == "ae" || suffix == "nc") { return 3 }
+    if(suffix == "e" || suffix == "z") { return 4 }
+    if(suffix == "ne" || suffix == "nz") { return 5 }
+    if(suffix == "be") { return 6 }
+    if(suffix == "a") { return 7 }
+    if(suffix == "s") { return 8 }
+    if(suffix == "ns") { return 9 }
+    if(suffix == "p") { return 10 }
+    if(suffix == "np") { return 11 }
+    if(suffix == "l") { return 12 }
+    if(suffix == "ge") { return 13 }
+    if(suffix == "le") { return 14 }
+    if(suffix == "g") { return 15 }
+    throw "nanoc: unsupported condition " + copy(suffix)
+}
+
+fun nativeExpression(view string text) -> NativeOperand {
+    var expressionResult = NativeOperand()
+    var first = strings.char_code(copy(text),0)
+    if(first == 45 || first == 43 || first == 40 || first == 126 || (first >= 48 && first <= 57)) {
+        expressionResult.displacement = nativeConstant(text)
+        return expressionResult
+    }
+    var end = 0
+    while(end < strings.length(copy(text))) {
+        var ch = strings.substring(copy(text),end,end + 1)
+        if(ch == "+" || ch == "-") { break }
+        end = end + 1
+    }
+    expressionResult.symbol = strings.trim(strings.substring(copy(text),0,end))
+    if(end < strings.length(copy(text))) { expressionResult.displacement = nativeConstant(strings.substring(copy(text),end,strings.length(copy(text)))) }
+    return expressionResult
+}
+fun nativeInstruction(view mut NativeObject O, view string mnemonic, view array[string] parts) {
+    var array[string] fixed = ["ret","leave","cqto","cltd","syscall","hlt","nop","rep stosb","rep movsb","fld1","fldz","fchs","fscale","faddp","fmulp","fsubp","fsubrp","fdivp","fdivrp"]
+    // Packed little-endian opcode bytes (for example cqto = 48 99).
+    var array[int] codes = [195,201,39240,153,1295,244,144,43763,42227,59609,61145,57561,64985,49630,51678,57822,59870,61918,63966]
+    var index = arrays.index_of(fixed,mnemonic)
+    if(index >= 0) {
+        var value = arrays.at(codes,index)
+        nativeByte(O,value & 255)
+        if(value > 255) { nativeByte(O,(value >> 8) & 255) }
+        return
+    }
+    if(mnemonic == "call" || mnemonic == "jmp") {
+        if(arrays.length(parts) != 1) { throw "nanoc: invalid branch operand" }
+        var target = arrays.at(parts,0)
+        if(strings.starts_with(copy(target),"*")) {
+            var operand = nativeOperand(strings.substring(copy(target),1,strings.length(copy(target))))
+            var group = 2
+            if(mnemonic == "jmp") { group = 4 }
+            nativeRM(O,255,4,group,operand,false,0)
+        } else {
+            if(mnemonic == "call") { nativeByte(O,232); nativeRelocate(O,target,4,-4,4) } else { nativeByte(O,233); nativeRelocate(O,target,2,-4,4) }
+        }
+        return
+    }
+    if(strings.starts_with(copy(mnemonic),"j")) {
+        nativeByte(O,15); nativeByte(O,128 + nativeCondition(strings.substring(copy(mnemonic),1,strings.length(copy(mnemonic)))))
+        nativeRelocate(O,arrays.at(parts,0),2,-4,4)
+        return
+    }
+    if(mnemonic == "fxch" || mnemonic == "fstp" || mnemonic == "fucomi" || mnemonic == "fucomip" || mnemonic == "fsub") {
+        var operand = arrays.at(parts,0)
+        var reg = fmt.to_int(strings.substring(copy(operand),4,strings.length(copy(operand)) - 1))
+        if(reg < 0 || reg > 7) { throw "nanoc: unsupported x87 register" }
+        var opcode = 217
+        var base = 200
+        if(mnemonic == "fstp") { opcode = 221; base = 216 }
+        if(mnemonic == "fucomi") { opcode = 219; base = 232 }
+        if(mnemonic == "fucomip") { opcode = 223; base = 232 }
+        if(mnemonic == "fsub") { opcode = 216; base = 224 }
+        nativeByte(O,opcode); nativeByte(O,base + reg)
+        return
+    }
+    var a = NativeOperand()
+    var b = NativeOperand()
+    if(arrays.length(parts) > 0) { a = nativeOperand(arrays.at(parts,0)) }
+    if(arrays.length(parts) > 1) { b = nativeOperand(arrays.at(parts,1)) }
+    if(strings.starts_with(copy(mnemonic),"set")) {
+        nativeRM(O,144 + nativeCondition(strings.substring(copy(mnemonic),3,strings.length(copy(mnemonic)))),1,0,a,true,0)
+        return
+    }
+    if(mnemonic == "pushq" || mnemonic == "popq") {
+        if(mnemonic == "pushq" && a.kind == "immediate") { nativeByte(O,104); nativeWord(O,a.displacement,4); return; }
+        if(a.kind != "register") { throw "nanoc: unsupported push/pop operand" }
+        nativeRex(O,4,0,a,false)
+        var base = 80
+        if(mnemonic == "popq") { base = 88 }
+        nativeByte(O,base + (a.reg & 7))
+        return
+    }
+    if(mnemonic == "fldt" || mnemonic == "fstpt" || mnemonic == "fldl" || mnemonic == "fstpl" || mnemonic == "fildq" || mnemonic == "fisttpq") {
+        var opcode = 219
+        var group = 5
+        if(mnemonic == "fstpt") { group = 7 }
+        if(mnemonic == "fldl") { opcode = 221; group = 0 }
+        if(mnemonic == "fstpl") { opcode = 221; group = 3 }
+        if(mnemonic == "fildq") { opcode = 223; group = 5 }
+        if(mnemonic == "fisttpq") { opcode = 221; group = 1 }
+        nativeRM(O,opcode,4,group,a,false,0)
+        return
+    }
+    var array[string] sse = ["movsd","movss","movapd","movups","addsd","subsd","mulsd","divsd","xorpd","ucomisd","cvtsd2ss","cvtss2sd","cvtsi2sdq","cvttsd2siq"]
+    index = arrays.index_of(sse,mnemonic)
+    if(index >= 0) {
+        var array[int] prefixes = [242,243,102,0,242,242,242,242,102,102,242,243,242,242]
+        var array[int] opcodes = [16,16,40,16,88,92,89,94,87,46,90,90,42,44]
+        var width = 4
+        if(index >= 12) { width = 8 }
+        var opcode = arrays.at(opcodes,index)
+        if(b.kind == "memory") {
+            if(index > 3 || a.kind != "xmm") { throw "nanoc: invalid SSE store" }
+            nativeSse(O,arrays.at(prefixes,index),opcode + 1,width,a.reg,b)
+        } else {
+            nativeSse(O,arrays.at(prefixes,index),opcode,width,b.reg,a)
+        }
+        return
+    }
+    if(mnemonic == "movsbq" || mnemonic == "movswq" || mnemonic == "movzbl" || mnemonic == "movzwl" || mnemonic == "movslq") {
+        var opcode = 190
+        var width = 8
+        var escaped = true
+        if(mnemonic == "movswq") { opcode = 191 }
+        if(mnemonic == "movzbl") { opcode = 182; width = 4 }
+        if(mnemonic == "movzwl") { opcode = 183; width = 4 }
+        if(mnemonic == "movslq") { opcode = 99; escaped = false }
+        var byteRex = (mnemonic == "movzbl" || mnemonic == "movsbq") && a.kind == "register" && a.reg >= 4
+        nativeRex(O,width,b.reg,a,byteRex)
+        if(escaped) { nativeByte(O,15) }
+        nativeByte(O,opcode); nativeModRM(O,b.reg,a,0)
+        return
+    }
+    var suffix = strings.substring(copy(mnemonic),strings.length(copy(mnemonic)) - 1,strings.length(copy(mnemonic)))
+    var operation = strings.substring(copy(mnemonic),0,strings.length(copy(mnemonic)) - 1)
+    var width = 8
+    if(suffix == "l") { width = 4 } else if(suffix == "w") { width = 2 } else if(suffix == "b") { width = 1 } else if(suffix != "q" && mnemonic != "btc") { throw "nanoc: unsupported native instruction " + copy(mnemonic) }
+    if(mnemonic == "movq" && (a.kind == "xmm" || b.kind == "xmm")) {
+        if(b.kind == "xmm") { nativeSse(O,102,110,8,b.reg,a) } else { nativeSse(O,102,126,8,a.reg,b) }
+        return
+    }
+    if(operation == "mov" || operation == "movabs") {
+        if(a.kind == "immediate") {
+            if(b.kind == "register" && (width == 8 || operation == "movabs")) {
+                nativeRex(O,width,0,b,false); nativeByte(O,184 + (b.reg & 7)); nativeWord(O,a.displacement,8)
+            } else {
+                var immediateWidth = width
+                if(width == 8) { immediateWidth = 4 }
+                var opcode = 199
+                if(width == 1) { opcode = 198 }
+                nativeRM(O,opcode,width,0,b,false,immediateWidth); nativeWord(O,a.displacement,immediateWidth)
+            }
+        } else if(b.kind == "register") {
+            var opcode = 139
+            if(width == 1) { opcode = 138 }
+            nativeRM(O,opcode,width,b.reg,a,false,0)
+        } else {
+            if(a.kind != "register") { throw "nanoc: invalid native move" }
+            var opcode = 137
+            if(width == 1) { opcode = 136 }
+            nativeRM(O,opcode,width,a.reg,b,false,0)
+        }
+        return
+    }
+    if(operation == "lea") { nativeRM(O,141,width,b.reg,a,false,0); return; }
+    var array[string] arithmetic = ["add","or","and","sub","xor","cmp","test"]
+    index = arrays.index_of(arithmetic,operation)
+    if(index >= 0) {
+        var array[int] groups = [0,1,4,5,6,7,0]
+        var array[int] opcodes = [1,9,33,41,49,57,133]
+        var opcode = arrays.at(opcodes,index)
+        if(a.kind == "immediate") {
+            var size = width
+            if(size == 8) { size = 4 }
+            opcode = 129
+            if(width == 1) { opcode = 128 }
+            if(operation == "test") { opcode = 247; if(width == 1) { opcode = 246 } }
+            nativeRM(O,opcode,width,arrays.at(groups,index),b,false,size); nativeWord(O,a.displacement,size)
+        } else {
+            if(width == 1) { opcode = opcode - 1 }
+            if(a.kind == "register") { nativeRM(O,opcode,width,a.reg,b,false,0) } else if(b.kind == "register" && operation != "test") { nativeRM(O,opcode + 2,width,b.reg,a,false,0) } else { throw "nanoc: invalid native arithmetic operands" }
+        }
+        return
+    }
+    if(operation == "imul") {
+        if(a.kind == "immediate") { nativeRM(O,105,width,b.reg,b,false,4); nativeWord(O,a.displacement,4) } else { nativeRM(O,175,width,b.reg,a,true,0) }
+        return
+    }
+    if(operation == "neg" || operation == "not" || operation == "div" || operation == "idiv") {
+        var group = 3
+        if(operation == "not") { group = 2 }
+        if(operation == "div") { group = 6 }
+        if(operation == "idiv") { group = 7 }
+        nativeRM(O,247,width,group,a,false,0)
+        return
+    }
+    if(operation == "shl" || operation == "sal" || operation == "shr" || operation == "sar") {
+        var group = 4
+        if(operation == "shr") { group = 5 }
+        if(operation == "sar") { group = 7 }
+        if(a.kind == "immediate") { nativeRM(O,193,width,group,b,false,1); nativeWord(O,a.displacement,1) } else if(a.kind == "register" && a.reg == 1 && a.width == 1) { nativeRM(O,211,width,group,b,false,0) } else { throw "nanoc: unsupported shift count" }
+        return
+    }
+    if(mnemonic == "btc") { nativeRM(O,186,8,7,b,true,1); nativeWord(O,a.displacement,1); return; }
+    throw "nanoc: unsupported native instruction " + copy(mnemonic)
+}
+
+fun nativeAssemble(view string assembly) -> NativeObject {
+    var O = NativeObject()
+    var lines = strings.split_array(copy(assembly),"\n")
+    var lineIndex = 0
+    while(lineIndex < arrays.length(lines)) {
+        var line = strings.trim(arrays.at(lines,lineIndex))
+        lineIndex = lineIndex + 1
+        if(line == "" || strings.starts_with(copy(line),"#")) { continue }
+        try {
+            if(strings.substring(copy(line),strings.length(copy(line)) - 1,strings.length(copy(line))) == ":") {
+                var name = strings.substring(copy(line),0,strings.length(copy(line)) - 1)
+                view mut var symbol = O.symbols[nativeSymbol(O,name)]
+                if(symbol.section != 0) { throw "duplicate assembler label " + name }
+                symbol.section = O.current
+                symbol.value = nativeOffset(O)
+                continue
+            }
+            var split = strings.index_of(copy(line)," ",0)
+            var mnemonic = copy(line)
+            var arguments = ""
+            if(split >= 0) { mnemonic = strings.substring(copy(line),0,split); arguments = strings.trim(strings.substring(copy(line),split + 1,strings.length(copy(line)))) }
+            if(mnemonic == ".text") { O.current = 1; continue; }
+            if(mnemonic == ".data") { O.current = 2; continue; }
+            if(mnemonic == ".section") {
+                if(arguments == ".rodata") { O.current = 3; continue; }
+                if(strings.starts_with(copy(arguments),".note.GNU-stack")) { continue }
+                throw "unsupported native section " + arguments
+            }
+            var parts = nativeParts(arguments)
+            if(mnemonic == ".globl" || mnemonic == ".local") {
+                view mut var symbol = O.symbols[nativeSymbol(O,arguments)]
+                symbol.global = mnemonic == ".globl"
+                continue
+            }
+            if(mnemonic == ".type") {
+                view mut var symbol = O.symbols[nativeSymbol(O,arrays.at(parts,0))]
+                if(arrays.at(parts,1) == "@function") { symbol.kind = 2 } else if(arrays.at(parts,1) == "@object") { symbol.kind = 1 } else { throw "unsupported native symbol type" }
+                continue
+            }
+            if(mnemonic == ".size") {
+                view mut var symbol = O.symbols[nativeSymbol(O,arrays.at(parts,0))]
+                var size = arrays.at(parts,1)
+                if(size == ".-" + symbol.name) { symbol.size = nativeOffset(O) - symbol.value } else { symbol.size = nativeConstant(size) }
+                continue
+            }
+            if(mnemonic == ".balign") {
+                var alignment = nativeConstant(arguments)
+                if(alignment <= 0 || alignment > 4096 || (alignment & (alignment - 1)) != 0) { throw "invalid native section alignment" }
+                view mut var section = O.sections[O.current - 1]
+                if(alignment > section.alignment) { section.alignment = alignment }
+                binaryAlign(section.bytes,alignment)
+                continue
+            }
+            if(mnemonic == ".string") {
+                if(strings.substring(copy(arguments),0,1) != "\"" || strings.substring(copy(arguments),strings.length(copy(arguments)) - 1,strings.length(copy(arguments))) != "\"") { throw "invalid native string" }
+                var bytes = decodeStringBytes(strings.substring(copy(arguments),1,strings.length(copy(arguments)) - 1))
+                var index = 0
+                while(index < arrays.length(bytes)) { nativeByte(O,arrays.at(bytes,index)); index = index + 1 }
+                nativeByte(O,0)
+                continue
+            }
+            if(mnemonic == ".float" || mnemonic == ".double" || mnemonic == ".tfloat") {
+                var size = 8
+                var format = "%lf"
+                if(mnemonic == ".float") { size = 4; format = "%f" }
+                if(mnemonic == ".tfloat") { size = 16; format = "%Lf" }
+                var bytes = binaryFloat(arguments,format,size)
+                var index = 0
+                while(index < size) { nativeByte(O,arrays.at(bytes,index)); index = index + 1 }
+                continue
+            }
+            if(mnemonic == ".byte" || mnemonic == ".short" || mnemonic == ".long" || mnemonic == ".quad") {
+                var width = 1
+                if(mnemonic == ".short") { width = 2 }
+                if(mnemonic == ".long") { width = 4 }
+                if(mnemonic == ".quad") { width = 8 }
+                var index = 0
+                while(index < arrays.length(parts)) {
+                    var expression = nativeExpression(arrays.at(parts,index))
+                    if(expression.symbol == "") { nativeWord(O,expression.displacement,width) } else if(width == 8) { nativeRelocate(O,expression.symbol,1,expression.displacement,8) } else if(width == 4) { nativeRelocate(O,expression.symbol,10,expression.displacement,4) } else { throw "unsupported native data relocation width" }
+                    index = index + 1
+                }
+                continue
+            }
+            if(mnemonic == "rep") { mnemonic = line; parts = [] }
+            nativeInstruction(O,mnemonic,parts)
+        } catch(err) { throw "nanoc: native assembler line " + ("" + lineIndex) + " (" + line + "): " + err }
+    }
+    return O
+}
+
+fun nativeString(view mut array[int] bytes, view string text) -> int {
+    var offset = arrays.length(bytes)
+    var index = 0
+    while(index < strings.length(copy(text))) { arrays.push(bytes,strings.char_code(copy(text),index)); index = index + 1 }
+    arrays.push(bytes,0)
+    return offset
+}
+fun nativeConcat(view mut array[int] target, view array[int] source) {
+    var index = 0
+    while(index < arrays.length(source)) { arrays.push(target,arrays.at(source,index)); index = index + 1 }
+}
+fun nativeHeader(view mut array[int] bytes, int kind, int entry, int phoff, int shoff, int phnum, int shnum, int shstr) {
+    var array[int] ident = [127,69,76,70,2,1,1,0,0,0,0,0,0,0,0,0]
+    nativeConcat(bytes,ident)
+    binaryAppend(bytes,kind,2); binaryAppend(bytes,62,2); binaryAppend(bytes,1,4)
+    binaryAppend(bytes,entry,8); binaryAppend(bytes,phoff,8); binaryAppend(bytes,shoff,8)
+    binaryAppend(bytes,0,4); binaryAppend(bytes,64,2); binaryAppend(bytes,56,2)
+    binaryAppend(bytes,phnum,2); binaryAppend(bytes,64,2); binaryAppend(bytes,shnum,2); binaryAppend(bytes,shstr,2)
+}
+fun nativeSectionHeader(view mut array[int] bytes, int name, int kind, int flags, int address, int offset, int size, int link, int info, int alignment, int entrySize) {
+    binaryAppend(bytes,name,4); binaryAppend(bytes,kind,4); binaryAppend(bytes,flags,8)
+    binaryAppend(bytes,address,8); binaryAppend(bytes,offset,8); binaryAppend(bytes,size,8)
+    binaryAppend(bytes,link,4); binaryAppend(bytes,info,4); binaryAppend(bytes,alignment,8); binaryAppend(bytes,entrySize,8)
+}
+fun nativeSymbolEntry(view mut array[int] bytes, int name, int binding, int kind, int section, int value, int size) {
+    binaryAppend(bytes,name,4); binaryAppend(bytes,(binding << 4) | kind,1); binaryAppend(bytes,0,1)
+    binaryAppend(bytes,section,2); binaryAppend(bytes,value,8); binaryAppend(bytes,size,8)
+}
+fun nativeWriteObject(view NativeObject O, view string path) {
+    var array[int] strtab = [0]
+    var array[int] symtab = []
+    nativeSymbolEntry(symtab,0,0,0,0,0,0)
+    var array[int] symbolIndices = []
+    var index = 0
+    while(index < arrays.length(O.symbols)) { arrays.push(symbolIndices,0); index = index + 1 }
+    var pass = 0
+    var firstGlobal = 1
+    while(pass < 2) {
+        index = 0
+        while(index < arrays.length(O.symbols)) {
+            view var symbol = O.symbols[index]
+            var global = symbol.global || symbol.section == 0
+            if((pass == 0 && global == false) || (pass == 1 && global)) {
+                symbolIndices[index] = arrays.length(symtab) / 24
+                var binding = 0
+                if(global) { binding = 1 }
+                nativeSymbolEntry(symtab,nativeString(strtab,symbol.name),binding,symbol.kind,symbol.section,symbol.value,symbol.size)
+            }
+            index = index + 1
+        }
+        if(pass == 0) { firstGlobal = arrays.length(symtab) / 24 }
+        pass = pass + 1
+    }
+    var array[NativeSection] sections = []
+    index = 0
+    while(index < 3) { arrays.push(sections,arrays.at(O.sections,index)); index = index + 1 }
+    index = 0
+    while(index < 3) {
+        var section = NativeSection(".rela" + arrays.at(O.sections,index).name,0)
+        section.kind = 4; section.alignment = 8
+        var ri = 0
+        while(ri < arrays.length(O.relocations)) {
+            view var relocation = O.relocations[ri]
+            if(relocation.section == index + 1) {
+                if(relocation.symbol == "") { throw "empty stored relocation " + ("" + ri) }
+                var si = 0
+                while(si < arrays.length(O.symbols) && arrays.at(O.symbols,si).name != relocation.symbol) { si = si + 1 }
+                if(si == arrays.length(O.symbols)) { throw "nanoc: missing relocation symbol " + relocation.symbol }
+                binaryAppend(section.bytes,relocation.offset,8)
+                binaryAppend(section.bytes,(arrays.at(symbolIndices,si) << 32) | relocation.kind,8)
+                binaryAppend(section.bytes,relocation.addend,8)
+            }
+            ri = ri + 1
+        }
+        arrays.push(sections,section)
+        index = index + 1
+    }
+    var symbols = NativeSection(".symtab",0); symbols.bytes = symtab; symbols.kind = 2; symbols.alignment = 8
+    arrays.push(sections,symbols)
+    var stringsSection = NativeSection(".strtab",0); stringsSection.bytes = strtab; stringsSection.kind = 3
+    arrays.push(sections,stringsSection)
+    var names = NativeSection(".shstrtab",0); names.kind = 3; names.bytes = [0]
+    arrays.push(sections,names)
+    arrays.push(sections,NativeSection(".note.GNU-stack",0))
+    var array[int] nameOffsets = []
+    index = 0
+    while(index < arrays.length(sections)) { arrays.push(nameOffsets,nativeString(names.bytes,sections[index].name)); index = index + 1 }
+    var array[int] bytes = []
+    nativeHeader(bytes,1,0,0,0,0,11,9)
+    var array[int] offsets = []
+    index = 0
+    while(index < arrays.length(sections)) {
+        view var section = sections[index]
+        binaryAlign(bytes,section.alignment)
+        arrays.push(offsets,arrays.length(bytes))
+        nativeConcat(bytes,section.bytes)
+        index = index + 1
+    }
+    binaryAlign(bytes,8)
+    binaryPatch(bytes,40,arrays.length(bytes),8)
+    nativeSectionHeader(bytes,0,0,0,0,0,0,0,0,0,0)
+    index = 0
+    while(index < arrays.length(sections)) {
+        view var section = sections[index]
+        var link = 0; var info = 0; var entrySize = 0
+        if(index >= 3 && index <= 5) { link = 7; info = index - 2; entrySize = 24 }
+        if(index == 6) { link = 8; info = firstGlobal; entrySize = 24 }
+        nativeSectionHeader(bytes,arrays.at(nameOffsets,index),section.kind,section.flags,0,arrays.at(offsets,index),arrays.length(section.bytes),link,info,section.alignment,entrySize)
+        index = index + 1
+    }
+    binaryWrite(path,bytes,false)
+}

@@ -1,19 +1,26 @@
+import "tests/arq/helpers.arq"
+import "tests/arq/preprocessor.arq"
+import "tests/arq/compiler.arq"
+import "tests/arq/language.arq"
+import "tests/arq/native.arq"
+
 task build {
     run "ntsc build"
 }
 
-task test {
-    build
-    exec("python3", ["tests/preprocessor_compare.py"])
-    run "./build/debug/nanoc -o /tmp/nanoc-stdio tests/c/stdio.c"
-    run "/tmp/nanoc-stdio"
-    run "./build/debug/nanoc -o /tmp/nanoc-headers tests/c/headers.c"
-    run "/tmp/nanoc-headers"
-    run "./build/debug/nanoc -o /tmp/nanoc-variadic tests/c/variadic.c"
-    run "/tmp/nanoc-variadic"
-    run "./build/debug/nanoc -o /tmp/nanoc-int-width tests/c/int_width.c"
-    run "/tmp/nanoc-int-width"
+task test_smoke after build {
+    let workspace = test_workspace("smoke")
+    let nanoc = absolute("build/debug/nanoc")
+    for suite in ["stdio", "headers", "variadic", "int_width"] {
+        let executable = absolute(workspace + "/" + suite)
+        checked(workspace, nanoc, ["-o", executable, "tests/c/" + suite + ".c"])
+        checked(workspace, executable, [])
+    }
+    finish_workspace(workspace)
+    print("standard I/O, headers, variadic functions, integer widths: ok")
 }
+
+task test after test_preprocessor, test_driver, test_abi, test_smoke, test_language, test_rejections, test_native {}
 
 task check {
     test

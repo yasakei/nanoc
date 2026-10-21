@@ -1,0 +1,123 @@
+# Hide (rather than merely avoid) cc/as/ld while compiling and linking natively.
+task test_native after build {
+    let workspace = test_workspace("native")
+    let nanoc = absolute("build/debug/nanoc")
+    let directory = absolute(workspace)
+    let executable = directory + "/program"
+    let local = directory + "/local.o"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    for suite in ["stdio", "headers", "variadic", "int_width", "integer64", "floating_expr", "assignment_expr", "initializers", "static_storage", "long_double"] {
+        let source = "tests/c/" + suite + ".c"
+        checked(workspace, "env", [empty_path, nanoc, "-c", source, "-o", local])
+        let object_headers = checked(workspace, "readelf", ["-hSWrs", local])
+        require(contains(object_headers, "REL (Relocatable file)"), "native object is not ELF ET_REL")
+        require(contains(object_headers, ".note.GNU-stack"), "native object lacks stack note")
+        # Check native objects using the independent host linker too.
+        checked(workspace, "cc", ["-no-pie", local, "-o", executable])
+        let host_output = checked(workspace, executable, [])
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", local, "-o", executable])
+        equal(checked(workspace, executable, []), host_output, suite + ": native object linking differs from host")
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", source, "-o", executable])
+        equal(checked(workspace, executable, []), host_output, suite + ": native source linking differs from host")
+    }
+    let headers = checked(workspace, "readelf", ["-hlWd", executable])
+    require(contains(headers, "EXEC (Executable file)"), "native output is not ELF ET_EXEC")
+    require(contains(headers, "INTERP"), "native output lacks a dynamic loader")
+    require(contains(headers, "NEEDED"), "native output lacks libc")
+    require(contains(headers, "GNU_STACK"), "native output lacks stack permissions")
+    require(!contains(headers, "RWE"), "native output has writable executable segments")
+
+    # Locals with the same names in independent units must not collide.
+    write(workspace + "/first.c", "static int value = 17; static int helper(void) { return value; } int first(void) { return helper(); }\n")
+    write(workspace + "/second.c", "static int value = 25; static int helper(void) { return value; } int second(void) { return helper(); }\n")
+    write(workspace + "/main.c", "int first(void); int second(void); int main(void) { return first() + second() - 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/first.c", directory + "/second.c", directory + "/main.c", "-o", executable])
+    checked(workspace, executable, [])
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/first.c", "-o", directory + "/first.o"])
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/second.c", "-o", directory + "/second.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/first.o", directory + "/second.o", directory + "/main.c", "-o", executable])
+    checked(workspace, executable, [])
+    # GCC section symbols, NOBITS, and small absolute-address relocations.
+    checked(workspace, "cc", ["-O2", "-fno-pie", "-c", directory + "/first.c", "-o", directory + "/host-first.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/host-first.o", directory + "/second.o", directory + "/main.c", "-o", executable])
+    checked(workspace, executable, [])
+
+    checked(workspace, "cc", ["-c", "tests/host/alignment.s", "-o", directory + "/alignment.o"])
+    for optimization in ["-O0", "-O2"] {
+        for suite in ["call_abi", "variadic_abi", "aggregate_abi", "tcc_aggregate_compat"] {
+            let source = "tests/c/" + suite + ".c"
+            let host = directory + "/host.o"
+            checked(workspace, "cc", [optimization, "-fno-pic", "-fno-pie", "-Wall", "-Wextra", "-Werror", "-c", "tests/host/" + suite + ".c", "-o", host])
+            if suite == "call_abi" {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", source, host, directory + "/alignment.o", "-o", executable])
+            } else {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", source, host, "-o", executable])
+            }
+            checked(workspace, executable, [])
+        }
+    }
+
+    write(workspace + "/run.c", "#include <stdio.h>\nint main(int argc, char **argv) { if (argc != 2) { return 1; } puts(argv[1]); return 23; }\n")
+    equal(expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-run", directory + "/run.c", "argument with spaces"], 23), "argument with spaces\n", "native -run did not forward argv/status")
+    write(workspace + "/math.c", "double sqrt(double); int main(void) { return sqrt(9.0) != 3.0; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-lm", directory + "/math.c", "-o", executable])
+    checked(workspace, executable, [])
+    write(workspace + "/shared.c", "int shared_answer(void) { return 42; }\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/shared.c", "-o", directory + "/libanswer.so"])
+    write(workspace + "/shared-main.c", "int shared_answer(void); int main(void) { return shared_answer() - 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-L", workspace, "-lanswer", directory + "/shared-main.c", "-o", executable])
+    checked_in(workspace, executable, [], "/tmp", 0)
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/libanswer.so", directory + "/shared-main.c", "-o", executable])
+    checked(workspace, executable, [])
+
+    # A native-linked function pointer must address its callable import stub.
+    write(workspace + "/pointer.c", "int puts(char *); int (*printer)(char *) = puts; int main(void) { return printer(\"import pointer\") < 0; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/pointer.c", "-o", executable])
+    equal(checked(workspace, executable, []), "import pointer\n", "import function pointer is not callable")
+    write(workspace + "/bss.c", "int values[100]; int host_bss(void) { values[99] += 42; return values[99]; }\n")
+    checked(workspace, "cc", ["-fno-pic", "-fno-pie", "-c", directory + "/bss.c", "-o", directory + "/bss.o"])
+    write(workspace + "/bss-main.c", "int host_bss(void); int main(void) { return host_bss() - 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/bss.o", directory + "/bss-main.c", "-o", executable])
+    checked(workspace, executable, [])
+    write(workspace + "/hostile ' ; touch injected ; '.c", "int main(void) { return 0; }\n")
+    checked_in(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/hostile ' ; touch injected ; '.c", "-o", directory + "/output ' ; touch injected ; '"], directory, 0)
+    checked(workspace, directory + "/output ' ; touch injected ; '", [])
+    require(!exists(workspace + "/injected"), "native filename was interpreted by a shell")
+
+    let rejected = directory + "/rejected"
+    write(workspace + "/missing.c", "int nanoc_missing(void); int main(void) { return nanoc_missing(); }\n")
+    let unresolved = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/missing.c", "-o", rejected], 1)
+    require(contains(unresolved, "unresolved native symbol nanoc_missing"), "missing import lacked explicit error")
+    require(!exists(workspace + "/rejected"), "failed native link produced output")
+    let duplicate = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/first.o", directory + "/first.o", directory + "/main.c", "-o", rejected], 1)
+    require(contains(duplicate, "duplicate native symbol first"), "duplicate symbol was not rejected")
+    let linker_flags = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-Wl,--as-needed", directory + "/main.c", "-o", rejected], 1)
+    require(contains(linker_flags, "does not support -Wl"), "native linker ignored host options")
+    checked(workspace, "ar", ["rcs", directory + "/libanswer.a", directory + "/first.o"])
+    let archive = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/libanswer.a", directory + "/main.c", "-o", rejected], 1)
+    require(contains(archive, "native archive linking is unsupported"), "archive silently fell back")
+    write(workspace + "/got.c", "extern int external_value; int main(void) { return external_value; }\n")
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/got.c", "-o", directory + "/got.o"])
+    let relocation = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/got.o", "-o", rejected], 1)
+    require(contains(relocation, "unsupported native relocation type"), "unsupported relocation was not rejected")
+    write(workspace + "/data.c", "extern int optind; int main(void) { return optind; }\n")
+    let data_import = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/data.c", "-o", rejected], 1)
+    require(contains(data_import, "native data/TLS imports are unsupported"), "data import was incorrectly treated as a function")
+    write(workspace + "/constructor.c", "__attribute__((constructor)) static void before_main(void) {}\n")
+    checked(workspace, "cc", ["-c", directory + "/constructor.c", "-o", directory + "/constructor.o"])
+    let constructor = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/constructor.o", "-o", rejected], 1)
+    require(contains(constructor, "unsupported allocated ELF section type") || contains(constructor, "constructor/destructor"), "constructor was silently discarded")
+    write(workspace + "/overflow.s", ".data\n.long main - . + 4294967295\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/overflow.s", "-o", directory + "/overflow.o"])
+    let overflow = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/overflow.o", directory + "/bss-main.c", directory + "/bss.o", "-o", rejected], 1)
+    require(contains(overflow, "native signed relocation overflow"), "native relocation silently truncated")
+    let no_main = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/first.o", "-o", rejected], 1)
+    require(contains(no_main, "native symbol main"), "missing main was not rejected")
+    write(workspace + "/broken.o", "not an ELF object")
+    let malformed = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/broken.o", "-o", rejected], 1)
+    require(contains(malformed, "truncated ELF input"), "malformed native input was not rejected")
+    require(!exists(workspace + "/rejected"), "rejected links produced output")
+    finish_workspace(workspace)
+    print("native ELF objects/linking, libc/shared imports, host ABI, no toolchain fallback: ok")
+}

@@ -1,68 +1,87 @@
 // nanoc — a small C compiler written in Neutron.
 //
-// -E keeps the preprocessor driver useful for differential testing.
-// The default path now lowers the integer-first C subset to x86-64 assembly
-// and invokes the system assembler/linker, with textual assembly as the first
-// backend boundary.
+// -c uses the native ELF assembler. Executable linking stays on the host
+// toolchain unless --native-link is explicitly requested; neither native
+// path falls back to a host assembler or linker.
 use "pp.nt"
 use "parse.nt"
 use "codegen.nt"
+use "elf.nt"
+use "link.nt"
 use arrays
 use sys
 use process
+use os
+use strings
 
-fun dumpPreprocessed(view string path, view array[Token] toks) {
+fun renderPreprocessed(view string path, view array[Token] toks) -> string {
     var n = arrays.length(toks)
     var i = 0
     var lastLine = 0
     var lastFile = copy(path)
     var buf = ""
+    var renderedText = ""
     while (i < n) {
         var t = arrays.at(toks, i)
-        if (t.kind == "eo") {
-            break
-        }
+        if (t.kind == "eo") { break }
         var tFile = t.file
-        if (tFile == "") {
-            tFile = copy(path)
-        }
+        if (tFile == "") { tFile = copy(path) }
         if (t.line != lastLine || tFile != lastFile) {
-            if (buf != "") {
-                say(buf)
-                buf = ""
-            }
+            if (buf != "") { renderedText = renderedText + buf + "\n"; buf = "" }
             var gap = t.line - lastLine
             if (lastLine == 0 || gap > 1 || t.line < lastLine || tFile != lastFile) {
-                say("# " + t.line + " \"" + tFile + "\"")
+                renderedText = renderedText + "# " + t.line + " \"" + tFile + "\"\n"
             }
             lastLine = t.line
             lastFile = copy(tFile)
         }
-        if (t.space && buf != "") {
-            buf = buf + " "
-        }
+        if (t.space && buf != "") { buf = buf + " " }
         var rendered = t.text
-        if (t.kind == "str") {
-            rendered = "\"" + t.text + "\""
-        } else if (t.kind == "chr") {
-            rendered = "'" + t.text + "'"
-        }
+        if (t.kind == "str") { rendered = "\"" + t.text + "\"" } else if (t.kind == "chr") { rendered = "'" + t.text + "'" }
         buf = buf + rendered
         i = i + 1
     }
-    if (buf != "") {
-        say(buf)
+    if (buf != "") { renderedText = renderedText + buf + "\n" }
+    return renderedText
+}
+
+fun cleanTemporaryFiles(view array[string] paths) {
+    var i = 0
+    while (i < arrays.length(paths)) {
+        var path = arrays.at(paths, i)
+        if (sys.exists(path) && sys.rm(copy(path)) == false) { sys.exit(1) }
+        i = i + 1
     }
 }
 
-fun loadTokens(string path, view mut array[Token] toks) -> int {
+fun shellQuote(view string text) -> string {
+    var quoted = "'"
+    var i = 0
+    while (i < strings.length(copy(text))) {
+        var ch = strings.substring(copy(text), i, i + 1)
+        if (ch == "'") { quoted = quoted + "'\"'\"'" } else { quoted = quoted + ch }
+        i = i + 1
+    }
+    return quoted + "'"
+}
+
+fun defaultOutput(view string path, view string suffix) -> string {
+    var start = strings.last_index_of(copy(path), "/") + 1
+    var name = strings.substring(copy(path), start, strings.length(copy(path)))
+    var dot = strings.last_index_of(copy(name), ".")
+    if (dot > 0) { name = strings.substring(copy(name), 0, dot) }
+    return name + copy(suffix)
+}
+
+fun loadTokens(string path, view array[string] includeDirs, string directives,
+    view mut array[Token] toks) -> int {
     if (sys.exists(path) == false) {
         say("nanoc: no such file: " + path)
         return 1
     }
     var text = sys.read(path)
     try {
-        preprocess(text, copy(path), toks)
+        preprocessConfigured(text, copy(path), includeDirs, directives, toks)
     } catch (err) {
         say(err)
         return 1
@@ -70,80 +89,217 @@ fun loadTokens(string path, view mut array[Token] toks) -> int {
     return 0
 }
 
+fun usage() {
+    say("usage: nanoc [--native-link] [-E|-S|-c|-run] [-o output] [-I dir] [-D name[=value]] [-U name] files...")
+}
+
 fun main() {
     var args = sys.args()
-    if (arrays.length(args) < 2) {
-        say("usage: nanoc [-E|-S] [-o output] file.c")
-        sys.exit(1)
-    }
-    var mode = "compile"
-    var output = "a.out"
-    var path = ""
+    var mode = "link"
+    var nativeLinking = false
+    var nativeObject = NativeObject()
+    var array[string] nativeLibraries = []
+    var array[string] libraryDirectories = []
+    var array[string] libraryNames = []
+    var nativeUnsupportedOptions = false
+    var output = ""
+    var array[string] inputs = []
+    var array[string] includeDirs = []
+    var directives = ""
+    var linkOptions = ""
+    var runArgs = ""
+    var optionsEnded = false
     var i = 1
     while (i < arrays.length(args)) {
         var a = arrays.at(args, i)
-        if (a == "-E") {
+        var prefix = strings.substring(copy(a), 0, 2)
+        if (mode == "run" && arrays.length(inputs) > 0) {
+            runArgs = runArgs + " " + shellQuote(a)
+        } else if (optionsEnded) {
+            arrays.push(inputs, copy(a))
+        } else if (a == "--") {
+            optionsEnded = true
+        } else if (a == "-h" || a == "--help") {
+            usage()
+            return
+        } else if (a == "--version" || a == "-v") {
+            say("nanoc experimental x86-64 C compiler (Neutron)")
+            return
+        } else if (a == "--native-link") {
+            nativeLinking = true
+        } else if (a == "-E") {
             mode = "preprocess"
         } else if (a == "-S") {
             mode = "assembly"
         } else if (a == "-c") {
-            mode = "compile"
-        } else if (a == "-o") {
-            i = i + 1
-            if (i >= arrays.length(args)) {
-                say("nanoc: -o requires an output path")
-                sys.exit(1)
+            mode = "object"
+        } else if (a == "-run") {
+            mode = "run"
+        } else if (a == "-o" || prefix == "-I" || prefix == "-D" || prefix == "-U"
+            || prefix == "-L" || prefix == "-l") {
+            var value = ""
+            if (strings.length(copy(a)) == 2) {
+                i = i + 1
+                if (i >= arrays.length(args)) {
+                    say("nanoc: " + a + " requires an argument")
+                    sys.exit(1)
+                }
+                value = arrays.at(args, i)
+            } else {
+                value = strings.substring(copy(a), 2, strings.length(copy(a)))
             }
-            output = arrays.at(args, i)
+            if (a == "-o") {
+                output = value
+            } else if (prefix == "-I") {
+                arrays.push(includeDirs, copy(value))
+            } else if (prefix == "-D") {
+                var equals = strings.index_of(copy(value), "=", 0)
+                if (equals < 0) {
+                    directives = directives + "#define " + value + " 1\n"
+                } else {
+                    directives = directives + "#define " + strings.substring(copy(value), 0, equals)
+                        + " " + strings.substring(copy(value), equals + 1, strings.length(copy(value))) + "\n"
+                }
+            } else if (prefix == "-U") {
+                directives = directives + "#undef " + value + "\n"
+            } else {
+                if (prefix == "-L") { arrays.push(libraryDirectories,copy(value)) }
+                if (prefix == "-l") { arrays.push(libraryNames,copy(value)) }
+                linkOptions = linkOptions + " " + shellQuote(prefix + value)
+            }
+        } else if (prefix == "-W" && strings.substring(copy(a), 0, 4) == "-Wl,") {
+            nativeUnsupportedOptions = true
+            linkOptions = linkOptions + " " + shellQuote(a)
+        } else if (strings.substring(copy(a), 0, 1) == "-") {
+            say("nanoc: unsupported option: " + a)
+            sys.exit(1)
         } else {
-            path = a
+            arrays.push(inputs, copy(a))
         }
         i = i + 1
     }
-    if (path == "") {
-        say("nanoc: no input file")
+    var executablePath = arrays.at(args, 0)
+    var executableDir = strings.substring(copy(executablePath), 0, strings.last_index_of(copy(executablePath), "/") + 1)
+    if (executableDir != "" && sys.exists(executableDir + "../../include/stddef.h")) {
+        arrays.push(includeDirs, executableDir + "../../include")
+    }
+    if (arrays.length(inputs) == 0) {
+        usage()
         sys.exit(1)
     }
-    var array[Token] toks = []
-    if (loadTokens(copy(path), toks) != 0) {
+    if ((mode == "assembly" || mode == "object" || mode == "preprocess")
+        && output != "" && arrays.length(inputs) != 1) {
+        say("nanoc: -o requires one input with -E, -S or -c")
         sys.exit(1)
     }
-    if (mode == "preprocess") {
-        var Cpp = Compiler()
+    if (mode == "run" && output != "") {
+        say("nanoc: -run cannot be combined with -o")
+        sys.exit(1)
+    }
+    if (nativeLinking && nativeUnsupportedOptions) {
+        say("nanoc: --native-link does not support -Wl options")
+        sys.exit(1)
+    }
+    if (nativeLinking && (mode == "link" || mode == "run")) {
         try {
-            parseTranslationUnit(Cpp, toks)
+            arrays.push(nativeLibraries,nativeFindLibrary("c",libraryDirectories))
+            i = 0
+            while (i < arrays.length(libraryNames)) {
+                var library = nativeFindLibrary(arrays.at(libraryNames,i),libraryDirectories)
+                if (arrays.index_of(nativeLibraries,library) < 0) { arrays.push(nativeLibraries,copy(library)) }
+                i = i + 1
+            }
+        } catch(err) { say(err); sys.exit(1) }
+    }
+    var linkInputs = ""
+    var preprocessed = ""
+    var array[string] temporaryFiles = []
+    i = 0
+    while (i < arrays.length(inputs)) {
+        var path = arrays.at(inputs, i)
+        var suffix = strings.substring(copy(path), strings.length(copy(path)) - 2, strings.length(copy(path)))
+        if ((suffix == ".o" || suffix == ".a" || strings.substring(copy(path), strings.length(copy(path)) - 3,
+            strings.length(copy(path))) == ".so") && (mode == "link" || mode == "run")) {
+            if (nativeLinking) {
+                try {
+                    if (suffix == ".a") { throw "nanoc: native archive linking is unsupported: " + copy(path) }
+                    if (suffix == ".o") { nativeMerge(nativeObject,nativeReadObject(path),i) } else { arrays.push(nativeLibraries,copy(path)) }
+                } catch(err) { say(err); cleanTemporaryFiles(temporaryFiles); sys.exit(1) }
+            } else { linkInputs = linkInputs + " " + shellQuote(path) }
+            i = i + 1
+            continue
+        }
+        var array[Token] toks = []
+        if (loadTokens(copy(path), includeDirs, copy(directives), toks) != 0) { cleanTemporaryFiles(temporaryFiles); sys.exit(1) }
+        if (mode == "preprocess") {
+            preprocessed = preprocessed + renderPreprocessed(path, toks)
+            i = i + 1
+            continue
+        }
+        var C = Compiler()
+        var asm = ""
+        try {
+            asm = compileTranslationUnit(C, toks)
         } catch (err) {
             say(err)
+            cleanTemporaryFiles(temporaryFiles)
             sys.exit(1)
         }
-        dumpPreprocessed(copy(path), toks)
-        return
+        var target = copy(output)
+        if (target == "") {
+            if (mode == "assembly") { target = defaultOutput(path, ".s") } else if (mode == "object") { target = defaultOutput(path, ".o") } else { target = "a.out" }
+        }
+        if (mode == "object" || (nativeLinking && (mode == "link" || mode == "run"))) {
+            try {
+                var assembled = nativeAssemble(asm)
+                if (mode == "object") { nativeWriteObject(assembled,target) } else { nativeMerge(nativeObject,assembled,i) }
+            } catch(err) { say(err); cleanTemporaryFiles(temporaryFiles); sys.exit(1) }
+            i = i + 1
+            continue
+        }
+        var asmPath = copy(target)
+        if (mode != "assembly") {
+            asmPath = os.temp_file("nanoc-asm-")
+            arrays.push(temporaryFiles, copy(asmPath))
+        }
+        if (sys.write(copy(asmPath), copy(asm)) == false) {
+            say("nanoc: cannot write " + asmPath)
+            cleanTemporaryFiles(temporaryFiles)
+            sys.exit(1)
+        }
+        if (mode == "link" || mode == "run") {
+            linkInputs = linkInputs + " -x assembler " + shellQuote(asmPath) + " -x none"
+        }
+        i = i + 1
     }
-    var C = Compiler()
-    var asm = ""
-    try {
-        asm = compileTranslationUnit(C, toks)
-    } catch (err) {
-        say(err)
-        sys.exit(1)
+    if (mode == "preprocess") {
+        if (output == "") {
+            if (preprocessed != "") { say(strings.substring(copy(preprocessed), 0, strings.length(copy(preprocessed)) - 1)) }
+        } else if (sys.write(copy(output), preprocessed) == false) { sys.exit(1) }
     }
-    var asmPath = copy(output) + ".nanoc.s"
-    if (mode == "assembly") {
-        asmPath = copy(output)
-        if (output == "a.out") {
-            asmPath = copy(path) + ".s"
+    var status = 0
+    var runDirectory = ""
+    if (mode == "link" || mode == "run") {
+        if (output == "") { output = "a.out" }
+        if (mode == "run") {
+            // A private directory avoids overwriting a.out or another invocation's executable.
+            runDirectory = os.temp_path("nanoc-run-")
+            if (sys.exists(runDirectory) || sys.mkdir(copy(runDirectory)) == false) { cleanTemporaryFiles(temporaryFiles); sys.exit(1) }
+            output = runDirectory + "/program"
+        }
+        if (nativeLinking) {
+            try { nativeLink(nativeObject,output,nativeLibraries) } catch(err) { say(err); status = 1 }
+        } else { status = process.exec("cc -no-pie -o " + shellQuote(output) + linkInputs + linkOptions) }
+        if (status == 0 && mode == "run") {
+            try {
+                if (nativeLinking) { status = nativeExecute(shellQuote(output) + runArgs) } else { status = process.exec(shellQuote(output) + runArgs) }
+            } catch(err) { say(err); status = 1 }
+        }
+        if (mode == "run" && sys.exists(output)) {
+            if (sys.rm(copy(output)) == false) { sys.exit(1) }
         }
     }
-    if (sys.write(copy(asmPath), copy(asm)) == false) {
-        say("nanoc: cannot write " + asmPath)
-        sys.exit(1)
-    }
-    if (mode == "assembly") {
-        return
-    }
-    var status = process.exec("cc -no-pie -o " + copy(output) + " " + copy(asmPath))
-    if (status != 0) {
-        say("nanoc: linker failed")
-        sys.exit(status)
-    }
+    cleanTemporaryFiles(temporaryFiles)
+    if (runDirectory != "" && sys.rm_all(copy(runDirectory)) == false) { sys.exit(1) }
+    sys.exit(status)
 }

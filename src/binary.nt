@@ -1,0 +1,135 @@
+use arrays
+use strings
+
+extern "C" {
+    long mmap(long address, size_t size, int prot, int flags, int fd, long offset)
+    int munmap(long address, size_t size)
+    long memset(long address, int value, size_t count)
+    long *memcpy(long destination, long source, size_t count)
+    long fopen(long path, long mode)
+    int fgetc(long stream)
+    int ferror(long stream)
+    int fputc(int value, long stream)
+    int fclose(long stream)
+    int sscanf(long text, long format, long output)
+    int chmod(long path, int mode)
+    int system(long command)
+}
+
+fun nativeCString(view string text) -> int {
+    if (strings.length(copy(text)) >= 4096) { throw "nanoc: native path/string exceeds 4095 bytes" }
+    unsafe {
+        var address = mmap(0, 4096, 3, 34, -1, 0)
+        if (address == -1) { throw "nanoc: cannot allocate binary buffer" }
+        var index = 0
+        while (index < strings.length(copy(text))) {
+            memset(address + index, strings.char_code(copy(text), index), 1)
+            index = index + 1
+        }
+        return address
+    }
+}
+
+fun nativeRelease(int address) {
+    unsafe {
+        if (munmap(address, 4096) != 0) { throw "nanoc: cannot release binary buffer" }
+    }
+}
+
+fun binaryWrite(view string path, view array[int] bytes, bool executable) {
+    var filename = nativeCString(path)
+    var mode = nativeCString("wb")
+    var failed = false
+    unsafe {
+        var stream = fopen(filename, mode)
+        if (stream == 0) { nativeRelease(filename); nativeRelease(mode); throw "nanoc: cannot open binary output " + copy(path) }
+        var index = 0
+        while (index < arrays.length(bytes)) {
+            if (fputc(arrays.at(bytes, index), stream) < 0) { failed = true; break }
+            index = index + 1
+        }
+        if (fclose(stream) != 0) { failed = true }
+        if (executable && failed == false && chmod(filename, 493) != 0) { failed = true }
+    }
+    nativeRelease(filename)
+    nativeRelease(mode)
+    if (failed) { throw "nanoc: cannot write binary output " + copy(path) }
+}
+
+fun binaryRead(view string path) -> array[int] {
+    var filename = nativeCString(path)
+    var mode = nativeCString("rb")
+    var array[int] bytes = []
+    unsafe {
+        var stream = fopen(filename, mode)
+        if (stream == 0) { nativeRelease(filename); nativeRelease(mode); throw "nanoc: cannot open binary input " + copy(path) }
+        while (true) {
+            var value = fgetc(stream)
+            if (value < 0) { break }
+            if (arrays.length(bytes) >= 16777216) { fclose(stream); nativeRelease(filename); nativeRelease(mode); throw "nanoc: native input exceeds 16 MiB" }
+            arrays.push(bytes, value)
+        }
+        if (ferror(stream) != 0) { fclose(stream); nativeRelease(filename); nativeRelease(mode); throw "nanoc: cannot read binary input" }
+        if (fclose(stream) != 0) { nativeRelease(filename); nativeRelease(mode); throw "nanoc: cannot close binary input" }
+    }
+    nativeRelease(filename)
+    nativeRelease(mode)
+    return bytes
+}
+
+fun binaryFloat(view string spelling, view string format, int size) -> array[int] {
+    var text = nativeCString(spelling)
+    var spec = nativeCString(format)
+    var array[int] bytes = []
+    unsafe {
+        var address = mmap(0, 4096, 3, 34, -1, 0)
+        if (address == -1) { nativeRelease(text); nativeRelease(spec); throw "nanoc: cannot allocate constant buffer" }
+        if (sscanf(text, spec, address) != 1) { nativeRelease(text); nativeRelease(spec); nativeRelease(address); throw "nanoc: invalid floating constant " + copy(spelling) }
+        var index = 0
+        while (index < size) {
+            var wordAddress = memcpy(address + index / 8 * 8, address + index / 8 * 8, 0)
+            var word = *wordAddress
+            arrays.push(bytes, (word >> ((index % 8) * 8)) & 255)
+            index = index + 1
+        }
+        nativeRelease(address)
+    }
+    nativeRelease(text)
+    nativeRelease(spec)
+    return bytes
+}
+
+fun binaryAppend(view mut array[int] bytes, int value, int width) {
+    var index = 0
+    while (index < width) { arrays.push(bytes, (value >> (index * 8)) & 255); index = index + 1 }
+}
+
+fun binaryPatch(view mut array[int] bytes, int offset, int value, int width) {
+    if (offset < 0 || offset + width > arrays.length(bytes)) { throw "nanoc: binary patch out of bounds" }
+    var index = 0
+    while (index < width) { bytes[offset + index] = (value >> (index * 8)) & 255; index = index + 1 }
+}
+
+fun binaryUnsigned(view array[int] bytes, int offset, int width) -> int {
+    if (offset < 0 || offset + width > arrays.length(bytes)) { throw "nanoc: truncated binary input" }
+    var value = 0
+    var index = 0
+    while (index < width) { value = value | (arrays.at(bytes, offset + index) << (index * 8)); index = index + 1 }
+    return value
+}
+
+fun binaryAlign(view mut array[int] bytes, int alignment) {
+    while (arrays.length(bytes) % alignment != 0) { arrays.push(bytes, 0) }
+}
+
+// system uses /bin/sh directly, so native -run works even without a shell on
+// PATH. This executes only the generated program, never a compiler/linker.
+fun nativeExecute(view string command) -> int {
+    var text = nativeCString(command)
+    var status = 0
+    unsafe { status = system(text) }
+    nativeRelease(text)
+    if(status < 0) { throw "nanoc: cannot execute native program" }
+    if((status & 127) != 0) { return 128 + (status & 127) }
+    return (status >> 8) & 255
+}

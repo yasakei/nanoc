@@ -1,0 +1,30 @@
+fn without_line_markers(text) {
+    var normalized = ""
+    var line = ""
+    for character in text {
+        if character == "\n" {
+            if !starts_with(line, "# ") {
+                normalized = normalized + line + "\n"
+            }
+            line = ""
+        } else {
+            line = line + character
+        }
+    }
+    if line != "" && !starts_with(line, "# ") {
+        normalized = normalized + line + "\n"
+    }
+    return normalized
+}
+
+task test_preprocessor after build {
+    let workspace = test_workspace("preprocessor")
+    let nanoc = absolute("build/debug/nanoc")
+    let input = "tests/preprocessor/input.c"
+    let actual = checked(workspace, nanoc, ["-E", input])
+    equal(read(workspace + "/command.stderr"), "", "nanoc preprocessor wrote to stderr")
+    let expected = checked(workspace, "gcc", ["-E", "-P", input])
+    equal(without_line_markers(actual), expected, "preprocessor output differs from gcc")
+    finish_workspace(workspace)
+    print("preprocessor: ok")
+}

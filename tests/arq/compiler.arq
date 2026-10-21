@@ -1,0 +1,188 @@
+task test_driver after build {
+    let workspace = test_workspace("driver")
+    let nanoc = absolute("build/debug/nanoc")
+    let directory = absolute(workspace)
+    let first = directory + "/first.c"
+    let second = directory + "/second.c"
+    let program = directory + "/program.c"
+    let executable = directory + "/linked program"
+    write(workspace + "/first.c", "static int private_value = 17;\nstatic int helper(void) { return private_value; }\nint first(void) { return helper(); }\n")
+    write(workspace + "/second.c", "static int private_value = 25;\nstatic int helper(void) { return private_value; }\nint second(void) { return helper(); }\n")
+    write(workspace + "/program.c", "int first(void); int second(void);\nint main(void) { return first() + second() - 42; }\n")
+
+    checked(workspace, nanoc, [first, second, program, "-o", executable])
+    checked(workspace, executable, [])
+    checked_in(workspace, nanoc, ["-c", first], directory, 0)
+    checked(workspace, "readelf", ["-h", directory + "/first.o"])
+    checked_in(workspace, nanoc, ["-c", second, program], directory, 0)
+    checked_in(workspace, nanoc, ["first.o", "second.o", "program.o", "-o", executable], directory, 0)
+    checked(workspace, executable, [])
+    checked_in(workspace, nanoc, ["-S", first], directory, 0)
+    require(contains(read(workspace + "/first.s"), ".local helper"), "static helper must have local linkage")
+    expect_exit(workspace, nanoc, ["-c", first, second, "-o", directory + "/invalid.o"], 1)
+    checked(workspace, nanoc, ["-S", program, "-o", directory + "/output.s"])
+    checked(workspace, "cc", ["-c", directory + "/output.s", "-o", directory + "/assembly.o"])
+    expect_exit(workspace, nanoc, ["--bogus", program], 1)
+    for option in ["-o", "-I", "-D", "-U", "-L", "-l"] {
+        expect_exit(workspace, nanoc, [option], 1)
+    }
+    require(contains(checked(workspace, nanoc, ["--help"]), "usage:"), "help output missing")
+    require(contains(checked(workspace, nanoc, ["--version"]), "nanoc"), "version output missing")
+
+    let include_a = directory + "/include a"
+    let include_b = directory + "/include b"
+    mkdir(workspace + "/include a")
+    mkdir(workspace + "/include b")
+    write(workspace + "/value.h", "#define VALUE 11\n")
+    write(workspace + "/include a/value.h", "#define VALUE 42\n")
+    write(workspace + "/include b/value.h", "#define VALUE 99\n")
+    let configured = directory + "/configured.c"
+    write(workspace + "/configured.c", """#include <value.h>
+#ifndef FLAG
+#error missing command line flag
+#endif
+#ifdef REMOVE
+#error undefine did not work
+#endif
+int main(void) { return VALUE + FLAG - EXPECTED; }
+""")
+    let flags = ["-I", include_a, "-I" + include_b, "-D", "FLAG=3", "-DEXPECTED=45", "-DREMOVE", "-U", "REMOVE"]
+    # Arq arrays do not concatenate: assemble the command with the same safe quoting helper.
+    var configured_command = shell_quote(nanoc)
+    for flag in flags {
+        configured_command = configured_command + " " + shell_quote(flag)
+    }
+    checked(workspace, "sh", ["-c", configured_command + " " + shell_quote(configured) + " -o " + shell_quote(executable)])
+    checked(workspace, executable, [])
+    let preprocessed = checked(workspace, "sh", ["-c", configured_command + " -E " + shell_quote(configured)])
+    let pp_file = directory + "/configured.i"
+    checked(workspace, "sh", ["-c", configured_command + " -E " + shell_quote(configured) + " -o " + shell_quote(pp_file)])
+    equal(read(workspace + "/configured.i"), preprocessed, "-E -o differs from stdout")
+    checked(workspace, "cc", [pp_file, "-o", executable])
+    checked(workspace, executable, [])
+
+    let quoted = directory + "/quoted.c"
+    write(workspace + "/quoted.c", "#include \"value.h\"\nint main(void) { return VALUE - 11; }\n")
+    checked(workspace, nanoc, ["-I" + include_a, quoted, "-o", executable])
+    checked(workspace, executable, [])
+    let function_macro = directory + "/function.c"
+    write(workspace + "/function.c", "int main(void) { return TWICE(21) - 42; }\n")
+    checked(workspace, nanoc, ["-DTWICE(x)=((x)+(x))", function_macro, "-o", executable])
+    checked(workspace, executable, [])
+    let non_c = directory + "/not-c.c"
+    write(workspace + "/not-c.c", "this is not C;\n")
+    require(contains(checked(workspace, nanoc, ["-E", non_c]), "this is not C;"), "-E must not parse C")
+    expect_exit(workspace, nanoc, [non_c], 1)
+
+    let hostile = directory + "/source ' ; touch injected ; '.c"
+    let hostile_output = directory + "/output ' ; touch injected ; '"
+    write(workspace + "/source ' ; touch injected ; '.c", "int main(void) { return 0; }\n")
+    checked_in(workspace, nanoc, [hostile, "-o", hostile_output], directory, 0)
+    checked(workspace, hostile_output, [])
+    require(!exists(workspace + "/injected"), "filename was interpreted as shell code")
+
+    let run_input = directory + "/run.c"
+    write(workspace + "/run.c", """#include <stdio.h>
+int main(int argc, char **argv) {
+    if (argc != 3) { return 1; }
+    puts(argv[1]);
+    puts(argv[2]);
+    return 23;
+}
+""")
+    write(workspace + "/a.out", "DO NOT OVERWRITE")
+    let run_output = checked_in(workspace, nanoc, ["-run", run_input, "hello world", "' ; touch injected ; '"], directory, 23)
+    equal(run_output, "hello world\n' ; touch injected ; '\n", "-run lost argument quoting")
+    equal(read(workspace + "/a.out"), "DO NOT OVERWRITE", "-run overwrote a.out")
+    require(!exists(workspace + "/injected"), "run argument was interpreted as shell code")
+    equal(len(glob(workspace + "/*.nanoc.s")), 0, "temporary assembly leaked")
+
+    write(workspace + "/library.c", "int library_value(void) { return 42; }\n")
+    checked(workspace, "cc", ["-c", directory + "/library.c", "-o", directory + "/library.o"])
+    checked(workspace, "ar", ["rcs", directory + "/libanswer.a", directory + "/library.o"])
+    let library_user = directory + "/library-user.c"
+    write(workspace + "/library-user.c", "int library_value(void); int main(void) { return library_value() - 42; }\n")
+    checked(workspace, nanoc, [library_user, "-L", directory, "-lanswer", "-Wl,--as-needed", "-o", executable])
+    checked(workspace, executable, [])
+    checked(workspace, nanoc, [library_user, directory + "/libanswer.a", "-o", executable])
+    checked(workspace, executable, [])
+    finish_workspace(workspace)
+    print("driver, multi-file, include flags, macros, run arguments, library linking: ok")
+}
+
+task test_abi after build {
+    let workspace = test_workspace("abi")
+    let nanoc = absolute("build/debug/nanoc")
+    let directory = absolute(workspace)
+    let executable = directory + "/program"
+    checked(workspace, "cc", ["-c", "tests/host/alignment.s", "-o", directory + "/alignment.o"])
+    for suite in ["call_abi", "variadic_abi", "aggregate_abi", "tcc_aggregate_compat"] {
+        let host = directory + "/host-" + suite + ".o"
+        let local = directory + "/local-" + suite + ".o"
+        let source = "tests/c/" + suite + ".c"
+        checked(workspace, "cc", ["-Wall", "-Wextra", "-Werror", "-c", "tests/host/" + suite + ".c", "-o", host])
+        checked(workspace, nanoc, ["-c", source, "-o", local])
+        if suite == "call_abi" {
+            checked(workspace, "cc", ["-no-pie", local, host, directory + "/alignment.o", "-o", executable])
+            checked(workspace, executable, [])
+            checked(workspace, nanoc, [source, host, directory + "/alignment.o", "-o", executable])
+        } else {
+            checked(workspace, "cc", ["-no-pie", local, host, "-o", executable])
+            checked(workspace, executable, [])
+            checked(workspace, nanoc, [source, host, "-o", executable])
+        }
+        checked(workspace, executable, [])
+    }
+    # Optimization often makes ABI mistakes visible that an O0 host masks.
+    let optimized_host = directory + "/host-aggregate-optimized.o"
+    let aggregate_local = directory + "/local-aggregate_abi.o"
+    checked(workspace, "cc", ["-O2", "-Wall", "-Wextra", "-Werror", "-c", "tests/host/aggregate_abi.c", "-o", optimized_host])
+    checked(workspace, "cc", ["-no-pie", aggregate_local, optimized_host, "-o", executable])
+    checked(workspace, executable, [])
+    checked(workspace, nanoc, ["tests/c/aggregate_abi.c", optimized_host, "-o", executable])
+    checked(workspace, executable, [])
+    let tcc = env("TCC")
+    let tcc_lib = env("TCC_LIB")
+    if tcc != "" {
+        let tcc_local = directory + "/tcc-aggregate-local.o"
+        let tcc_host = directory + "/tcc-aggregate-host.o"
+        if tcc_lib == "" {
+            checked(workspace, tcc, ["-c", "tests/c/aggregate_abi.c", "-o", tcc_local])
+            checked(workspace, tcc, ["-c", "tests/host/aggregate_abi.c", "-o", tcc_host])
+        } else {
+            checked(workspace, tcc, ["-B" + tcc_lib, "-c", "tests/c/aggregate_abi.c", "-o", tcc_local])
+            checked(workspace, tcc, ["-B" + tcc_lib, "-c", "tests/host/aggregate_abi.c", "-o", tcc_host])
+        }
+        # Retain the full mixed-record fixture as a TinyCC-only reference.
+        # This checkout classifies a mixed record as integer in both eightbytes,
+        # unlike the per-eightbyte System V convention used by GCC and nanoc.
+        # Link with TinyCC to include its __va_arg runtime helper.
+        if tcc_lib == "" {
+            checked(workspace, tcc, [tcc_local, tcc_host, "-o", executable])
+        } else {
+            checked(workspace, tcc, ["-B" + tcc_lib, tcc_local, tcc_host, "-o", executable])
+        }
+        checked(workspace, executable, [])
+        let tcc_compatible_local = directory + "/tcc-compatible-local.o"
+        let tcc_compatible_host = directory + "/tcc-compatible-host.o"
+        let nanoc_compatible_local = directory + "/local-tcc_aggregate_compat.o"
+        let gcc_compatible_host = directory + "/host-tcc_aggregate_compat.o"
+        if tcc_lib == "" {
+            checked(workspace, tcc, ["-c", "tests/c/tcc_aggregate_compat.c", "-o", tcc_compatible_local])
+            checked(workspace, tcc, ["-c", "tests/host/tcc_aggregate_compat.c", "-o", tcc_compatible_host])
+            checked(workspace, tcc, [tcc_compatible_local, gcc_compatible_host, "-o", executable])
+            checked(workspace, executable, [])
+            checked(workspace, tcc, [nanoc_compatible_local, tcc_compatible_host, "-o", executable])
+        } else {
+            checked(workspace, tcc, ["-B" + tcc_lib, "-c", "tests/c/tcc_aggregate_compat.c", "-o", tcc_compatible_local])
+            checked(workspace, tcc, ["-B" + tcc_lib, "-c", "tests/host/tcc_aggregate_compat.c", "-o", tcc_compatible_host])
+            checked(workspace, tcc, ["-B" + tcc_lib, tcc_compatible_local, gcc_compatible_host, "-o", executable])
+            checked(workspace, executable, [])
+            checked(workspace, tcc, ["-B" + tcc_lib, nanoc_compatible_local, tcc_compatible_host, "-o", executable])
+        }
+        checked(workspace, executable, [])
+        print("TinyCC full aggregate reference and compatible aggregate cross-links: ok")
+    }
+    finish_workspace(workspace)
+    print("stack alignment, scalar/aggregate host ABI, hidden returns, varargs (O0/O2): ok")
+}

@@ -1,0 +1,100 @@
+# Test logic stays in Arq; sh is used only to collect exit status and raw output.
+fn require(condition, message) {
+    if !condition {
+        error(message)
+    }
+}
+
+fn equal(actual, expected, message) {
+    if actual != expected {
+        error(message + "\nexpected: " + expected + "\nactual: " + actual)
+    }
+}
+
+fn starts_with(text, prefix) {
+    if len(text) < len(prefix) {
+        return false
+    }
+    var index = 0
+    for character in prefix {
+        if text[index] != character {
+            return false
+        }
+        index = index + 1
+    }
+    return true
+}
+
+fn contains(text, needle) {
+    var index = 0
+    for character in text {
+        if index + len(needle) > len(text) {
+            return false
+        }
+        var matches = true
+        var offset = 0
+        for expected in needle {
+            if text[index + offset] != expected {
+                matches = false
+                break
+            }
+            offset = offset + 1
+        }
+        if matches {
+            return true
+        }
+        index = index + 1
+    }
+    return false
+}
+
+fn shell_quote(text) {
+    var quoted = "'"
+    for character in text {
+        if character == "'" {
+            quoted = quoted + "'\"'\"'"
+        } else {
+            quoted = quoted + character
+        }
+    }
+    return quoted + "'"
+}
+
+fn test_workspace(name) {
+    mkdir("build")
+    return output("mktemp", ["-d", "build/test-" + name + "-XXXXXX"])
+}
+
+fn absolute(path) {
+    return cwd() + "/" + path
+}
+
+fn checked_in(workspace, program, arguments, directory, expected) {
+    var command = shell_quote(program)
+    for argument in arguments {
+        command = command + " " + shell_quote(argument)
+    }
+    let stdout = workspace + "/command.stdout"
+    let stderr = workspace + "/command.stderr"
+    var script = "cd " + shell_quote(directory) + " || exit 1; " + command
+    script = script + " >" + shell_quote(absolute(stdout)) + " 2>" + shell_quote(absolute(stderr))
+    script = script + "; status=$?; if [ \"$status\" -ne " + expected + " ]; then "
+    script = script + "printf 'unexpected exit: %s (expected " + expected + ")\\n' \"$status\" >&2; "
+    script = script + "cat " + shell_quote(absolute(stdout)) + " " + shell_quote(absolute(stderr))
+    script = script + " >&2; exit 1; fi"
+    exec("sh", ["-c", script])
+    return read(stdout)
+}
+
+fn checked(workspace, program, arguments) {
+    return checked_in(workspace, program, arguments, cwd(), 0)
+}
+
+fn expect_exit(workspace, program, arguments, expected) {
+    return checked_in(workspace, program, arguments, cwd(), expected)
+}
+
+fn finish_workspace(workspace) {
+    # Only the fresh mktemp directory belonging to this test invocation is removed.
+    exec("rm", ["-rf", "--", workspace])
+}

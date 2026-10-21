@@ -42,6 +42,7 @@ class PP {
     var array[string] hiddenSet
     // include stack: file paths, for relative includes and __FILE__
     var array[string] curFile
+    var array[string] includeDirs
 
     fun init() {
         this.defs = [ ]
@@ -49,6 +50,7 @@ class PP {
         this.conds = [ ]
         this.hiddenSet = [ ]
         this.curFile = [ ]
+        this.includeDirs = [ ]
     }
 
     fun findDef(view string name) -> int {
@@ -80,15 +82,24 @@ class PP {
 // runs the whole preprocessor over one translation unit, appending expanded
 // tokens to out. Fatal errors exit through sys.exit.
 fun preprocess(string source, string filePath, view mut array[Token] out) -> int {
+    var array[string] includeDirs = []
+    return preprocessConfigured(source, filePath, includeDirs, "", out)
+}
+
+fun preprocessConfigured(string source, string filePath, view array[string] includeDirs,
+    string directives, view mut array[Token] out) -> int {
     var P = PP()
-    arrays.push(P.curFile, filePath)
+    P.includeDirs = copy(includeDirs)
+    arrays.push(P.curFile, copy(filePath))
+    if (directives != "") {
+        var array[Token] options = []
+        var array[Token] discarded = []
+        lex(directives, options)
+        runPP(P, options, discarded)
+    }
     var array[Token] raw = []
     lex(source, raw)
     runPP(P, raw, out)
-    if (arrays.length(P.conds) > 0) {
-        say("nanoc: unterminated conditional at end of input")
-        sys.exit(1)
-    }
     return 0
 }
 
@@ -118,7 +129,7 @@ fun lineEnd(view array[Token] toks, int i) -> int {
 
 // ---------------------------------------------------------------- includes
 
-fun doInclude(view mut PP P, string fname, int line, view mut array[Token] out) {
+fun doInclude(view mut PP P, string fname, int line, bool systemHeader, view mut array[Token] out) {
     if (arrays.length(P.curFile) > 64) {
         ppFail(line, "#include nested too deeply")
         return
@@ -129,6 +140,7 @@ fun doInclude(view mut PP P, string fname, int line, view mut array[Token] out) 
         builtin = builtin + "typedef __builtin_va_list va_list;\n"
         builtin = builtin + "#define va_start(ap, last) __builtin_va_start(ap, last)\n"
         builtin = builtin + "#define va_arg(ap, type) __builtin_va_arg(ap, type)\n"
+        builtin = builtin + "#define va_copy(dst, src) __builtin_va_copy(dst, src)\n"
         builtin = builtin + "#define va_end(ap) __builtin_va_end(ap)\n"
         builtin = builtin + "#endif\n"
         var array[Token] rawBuiltin = []
@@ -144,11 +156,18 @@ fun doInclude(view mut PP P, string fname, int line, view mut array[Token] out) 
     if (k >= 0) {
         dir = strings.substring(cur, 0, k + 1)
     }
-    var path = dir + fname
-    if (sys.exists(path) == false) {
+    var path = ""
+    if (systemHeader == false && sys.exists(dir + fname)) { path = dir + fname }
+    var includeIndex = 0
+    while (path == "" && includeIndex < arrays.length(P.includeDirs)) {
+        var candidate = arrays.at(P.includeDirs, includeIndex) + "/" + fname
+        if (sys.exists(candidate)) { path = candidate }
+        includeIndex = includeIndex + 1
+    }
+    if (path == "") {
         if (sys.exists("include/" + fname)) {
             path = "include/" + fname
-        } else if (sys.exists(fname)) {
+        } else if (systemHeader == false && sys.exists(fname)) {
             path = fname
         } else if (sys.exists("/usr/include/" + fname)) {
             path = "/usr/include/" + fname
@@ -1058,7 +1077,14 @@ fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[To
         }
         var di = P.findDef(arrays.at(toks, j).text)
         if (di >= 0) {
-            P.defs = arrays.remove_at(P.defs, di)
+            // Class elements must be deep-copied before replacing the owning array.
+            var array[Defn] remaining = []
+            var index = 0
+            while (index < arrays.length(P.defs)) {
+                if (index != di) { arrays.push(remaining, copyDefn(arrays.at(P.defs, index))) }
+                index = index + 1
+            }
+            P.defs = remaining
         }
         return endI
     }
@@ -1069,7 +1095,7 @@ fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[To
         }
         var ft = arrays.at(toks, j)
         if (ft.kind == "str") {
-            doInclude(P, ft.text, ft.line, out)
+            doInclude(P, ft.text, ft.line, false, out)
             return endI
         }
         if (ft.kind == "pn" && ft.text == "<") {
@@ -1080,7 +1106,7 @@ fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[To
                 k = k + 1
             }
             if (k >= endI) { ppFail(nameTok.line, "unterminated system include") }
-            doInclude(P, fname, ft.line, out)
+            doInclude(P, fname, ft.line, true, out)
             return endI
         }
         // computed include: expand the line and retry
@@ -1089,7 +1115,7 @@ fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[To
         if (arrays.length(ex) > 0) {
             var e0 = arrays.at(ex, 0)
             if (e0.kind == "str") {
-                doInclude(P, e0.text, e0.line, out)
+                doInclude(P, e0.text, e0.line, false, out)
                 return endI
             }
             if (e0.kind == "pn" && e0.text == "<") {
@@ -1100,7 +1126,7 @@ fun runDirective(view mut PP P, view array[Token] toks, int i, view mut array[To
                     k2 = k2 + 1
                 }
                 if (k2 >= arrays.length(ex)) { ppFail(nameTok.line, "unterminated system include") }
-                doInclude(P, fname2, e0.line, out)
+                doInclude(P, fname2, e0.line, true, out)
                 return endI
             }
         }

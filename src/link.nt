@@ -1,0 +1,501 @@
+// Experimental ELF64 x86-64 linker. Never invokes a host toolchain.
+use "elf.nt"
+use sys
+
+fun nativeReadString(view array[int] bytes, int offset, int limit) -> string {
+    if(offset < 0 || limit > arrays.length(bytes) || offset >= limit) { throw "nanoc: invalid ELF string offset" }
+    var text = ""
+    while(offset < limit) {
+        var value = arrays.at(bytes,offset)
+        if(value == 0) { return text }
+        text = text + strings.from_char_code(value)
+        offset = offset + 1
+        if(strings.length(copy(text)) > 4095) { throw "nanoc: ELF string exceeds 4095 bytes" }
+    }
+    throw "nanoc: unterminated ELF string"
+}
+fun nativeRange(view array[int] bytes, int offset, int size) {
+    if(offset < 0 || size < 0 || offset > arrays.length(bytes) || size > arrays.length(bytes) - offset) { throw "nanoc: truncated ELF input" }
+}
+fun nativeValidateElf(view array[int] bytes, int kind) {
+    nativeRange(bytes,0,64)
+    if(binaryUnsigned(bytes,0,4) != 1179403647 || binaryUnsigned(bytes,4,1) != 2 || binaryUnsigned(bytes,5,1) != 1
+        || binaryUnsigned(bytes,6,1) != 1 || binaryUnsigned(bytes,16,2) != kind || binaryUnsigned(bytes,18,2) != 62
+        || binaryUnsigned(bytes,20,4) != 1 || binaryUnsigned(bytes,52,2) != 64 || binaryUnsigned(bytes,58,2) != 64) {
+        throw "nanoc: native linker requires little-endian ELF64 x86-64 input of type " + ("" + kind)
+    }
+    var count = binaryUnsigned(bytes,60,2)
+    if(count == 0) { throw "nanoc: extended or missing ELF section table is unsupported" }
+    nativeRange(bytes,binaryUnsigned(bytes,40,8),count * 64)
+}
+fun nativeRelocationWidth(int kind) -> int {
+    if(kind == 0) { return 0 }
+    if(kind == 1) { return 8 }
+    if(kind == 2 || kind == 4 || kind == 10 || kind == 11) { return 4 }
+    throw "nanoc: unsupported native relocation type " + ("" + kind)
+}
+fun nativeMerge(view mut NativeObject target, view NativeObject source, int objectId) {
+    var array[int] bases = []
+    var index = 0
+    while(index < arrays.length(source.sections)) {
+        view var section = source.sections[index]
+        view mut var destination = target.sections[index]
+        binaryAlign(destination.bytes,section.alignment)
+        arrays.push(bases,arrays.length(destination.bytes))
+        nativeConcat(destination.bytes,section.bytes)
+        if(section.alignment > destination.alignment) { destination.alignment = section.alignment }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(source.symbols)) {
+        view var symbol = source.symbols[index]
+        var name = copy(symbol.name)
+        if(symbol.global == false && symbol.section != 0) { name = ".native." + ("" + objectId) + "." + name }
+        view mut var destination = target.symbols[nativeSymbol(target,name)]
+        if(symbol.section != 0) {
+            if(destination.section != 0) { throw "nanoc: duplicate native symbol " + name }
+            destination.section = symbol.section
+            destination.value = symbol.value + arrays.at(bases,symbol.section - 1)
+            destination.size = symbol.size
+            destination.kind = symbol.kind
+        }
+        destination.global = symbol.global || symbol.section == 0
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(source.relocations)) {
+        view var relocation = source.relocations[index]
+        var name = copy(relocation.symbol)
+        var si = 0
+        while(si < arrays.length(source.symbols)) {
+            view var symbol = source.symbols[si]
+            if(symbol.name == name && symbol.global == false && symbol.section != 0) {
+                name = ".native." + ("" + objectId) + "." + name
+                break
+            }
+            si = si + 1
+        }
+        arrays.push(target.relocations,NativeRelocation(relocation.section,relocation.offset + arrays.at(bases,relocation.section - 1),name,relocation.kind,relocation.addend))
+        index = index + 1
+    }
+}
+fun nativeReadObject(view string path) -> NativeObject {
+    var bytes = binaryRead(path)
+    nativeValidateElf(bytes,1)
+    var O = NativeObject()
+    var shoff = binaryUnsigned(bytes,40,8)
+    var count = binaryUnsigned(bytes,60,2)
+    var nameIndex = binaryUnsigned(bytes,62,2)
+    if(nameIndex <= 0 || nameIndex >= count) { throw "nanoc: invalid ELF section-name table" }
+    var nameHeader = shoff + nameIndex * 64
+    if(binaryUnsigned(bytes,nameHeader + 4,4) != 3) { throw "nanoc: invalid ELF section-name strings" }
+    var nameOffset = binaryUnsigned(bytes,nameHeader + 24,8)
+    var nameSize = binaryUnsigned(bytes,nameHeader + 32,8)
+    nativeRange(bytes,nameOffset,nameSize)
+    var array[int] sectionMap = []
+    var array[int] sectionBases = []
+    var symtab = -1
+    var index = 0
+    while(index < count) {
+        var header = shoff + index * 64
+        var kind = binaryUnsigned(bytes,header + 4,4)
+        var flags = binaryUnsigned(bytes,header + 8,8)
+        var offset = binaryUnsigned(bytes,header + 24,8)
+        var size = binaryUnsigned(bytes,header + 32,8)
+        if(kind != 8) { nativeRange(bytes,offset,size) }
+        arrays.push(sectionMap,0); arrays.push(sectionBases,0)
+        if(kind == 2) {
+            if(symtab != -1) { throw "nanoc: multiple ELF symbol tables are unsupported" }
+            symtab = index
+        }
+        var sectionNameOffset = binaryUnsigned(bytes,header,4)
+        if(sectionNameOffset >= nameSize) { throw "nanoc: ELF section name out of bounds" }
+        var sectionName = nativeReadString(bytes,nameOffset + sectionNameOffset,nameOffset + nameSize)
+        if(sectionName == ".ctors" || sectionName == ".dtors" || sectionName == ".init" || sectionName == ".fini") {
+            throw "nanoc: native constructor/destructor sections are unsupported"
+        }
+        // Notes describe producer/build metadata; they have no loadable C contents.
+        if((flags & 2) != 0 && kind != 7) {
+            if((flags & 5) == 5) { throw "nanoc: writable executable native input sections are unsupported" }
+            if((flags & 1536) != 0 || (flags & 256) != 0) { throw "nanoc: TLS or grouped native sections are unsupported" }
+            if(kind != 1 && kind != 8) { throw "nanoc: unsupported allocated ELF section type " + ("" + kind) }
+            var destination = 3
+            if((flags & 4) != 0) { destination = 1 } else if((flags & 1) != 0) { destination = 2 }
+            var alignment = binaryUnsigned(bytes,header + 48,8)
+            if(alignment == 0) { alignment = 1 }
+            if(alignment < 1 || alignment > 4096 || (alignment & (alignment - 1)) != 0) { throw "nanoc: unsupported native section alignment" }
+            view mut var section = O.sections[destination - 1]
+            binaryAlign(section.bytes,alignment)
+            sectionMap[index] = destination
+            sectionBases[index] = arrays.length(section.bytes)
+            if(alignment > section.alignment) { section.alignment = alignment }
+            if(size > 16777216 - arrays.length(section.bytes)) { throw "nanoc: native section exceeds 16 MiB" }
+            var bi = 0
+            while(bi < size) {
+                var value = 0
+                if(kind != 8) { value = arrays.at(bytes,offset + bi) }
+                arrays.push(section.bytes,value)
+                bi = bi + 1
+            }
+        }
+        index = index + 1
+    }
+    if(symtab < 0) { throw "nanoc: ELF object has no symbol table" }
+    var header = shoff + symtab * 64
+    var symbolOffset = binaryUnsigned(bytes,header + 24,8)
+    var symbolSize = binaryUnsigned(bytes,header + 32,8)
+    var stringIndex = binaryUnsigned(bytes,header + 40,4)
+    if(stringIndex >= count || binaryUnsigned(bytes,header + 56,8) != 24 || symbolSize % 24 != 0) { throw "nanoc: invalid ELF symbol table" }
+    var stringHeader = shoff + stringIndex * 64
+    if(binaryUnsigned(bytes,stringHeader + 4,4) != 3) { throw "nanoc: ELF symbol strings are not STRTAB" }
+    var stringOffset = binaryUnsigned(bytes,stringHeader + 24,8)
+    var stringSize = binaryUnsigned(bytes,stringHeader + 32,8)
+    var array[string] symbolNames = []
+    index = 0
+    while(index < symbolSize / 24) {
+        var position = symbolOffset + index * 24
+        var nameOffset = binaryUnsigned(bytes,position,4)
+        if(nameOffset >= stringSize) { throw "nanoc: ELF symbol name out of bounds" }
+        var name = nativeReadString(bytes,stringOffset + nameOffset,stringOffset + stringSize)
+        var info = binaryUnsigned(bytes,position + 4,1)
+        var visibility = binaryUnsigned(bytes,position + 5,1)
+        var section = binaryUnsigned(bytes,position + 6,2)
+        var value = binaryUnsigned(bytes,position + 8,8)
+        var size = binaryUnsigned(bytes,position + 16,8)
+        if(index == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
+        if((info & 15) == 4) { arrays.push(symbolNames,""); index = index + 1; continue; }
+        if(section >= count) { throw "nanoc: absolute/common/extended ELF symbols are unsupported" }
+        if(section != 0 && arrays.at(sectionMap,section) == 0) { arrays.push(symbolNames,""); index = index + 1; continue; }
+        if((info >> 4) > 1 || visibility != 0) { throw "nanoc: weak or non-default-visibility ELF symbols are unsupported" }
+        if((info & 15) != 0 && (info & 15) != 1 && (info & 15) != 2 && (info & 15) != 3) { throw "nanoc: unsupported ELF symbol kind" }
+        if((info >> 4) == 0) { name = ".elf.local." + ("" + index) + "." + name }
+        if(name == "") { throw "nanoc: unnamed global ELF symbol" }
+        arrays.push(symbolNames,copy(name))
+        view mut var symbol = O.symbols[nativeSymbol(O,name)]
+        symbol.global = (info >> 4) == 1 || section == 0
+        symbol.kind = info & 15
+        symbol.size = size
+        if(section != 0) {
+            var sectionSize = binaryUnsigned(bytes,shoff + section * 64 + 32,8)
+            if(value < 0 || value > sectionSize || size < 0 || size > sectionSize - value) { throw "nanoc: ELF symbol exceeds section" }
+            if(symbol.section != 0) { throw "nanoc: duplicate ELF symbol " + name }
+            symbol.section = arrays.at(sectionMap,section)
+            symbol.value = value + arrays.at(sectionBases,section)
+        }
+        index = index + 1
+    }
+    index = 0
+    while(index < count) {
+        header = shoff + index * 64
+        var kind = binaryUnsigned(bytes,header + 4,4)
+        if(kind == 4 || kind == 9) {
+            var target = binaryUnsigned(bytes,header + 44,4)
+            if(target >= count) { throw "nanoc: ELF relocation target out of bounds" }
+            if(arrays.at(sectionMap,target) == 0) { index = index + 1; continue; }
+            if(kind == 9) { throw "nanoc: SHT_REL native relocations are unsupported; use RELA" }
+            if(binaryUnsigned(bytes,header + 40,4) != symtab || binaryUnsigned(bytes,header + 56,8) != 24) { throw "nanoc: invalid ELF relocation table" }
+            var offset = binaryUnsigned(bytes,header + 24,8)
+            var size = binaryUnsigned(bytes,header + 32,8)
+            if(size % 24 != 0) { throw "nanoc: truncated ELF relocation table" }
+            var ri = 0
+            while(ri < size / 24) {
+                var position = offset + ri * 24
+                var location = binaryUnsigned(bytes,position,8)
+                var info = binaryUnsigned(bytes,position + 8,8)
+                var relocationKind = info & 4294967295
+                var width = nativeRelocationWidth(relocationKind)
+                var symbolIndex = info >> 32
+                if(symbolIndex < 0 || symbolIndex >= arrays.length(symbolNames)) { throw "nanoc: ELF relocation symbol out of bounds" }
+                var targetSize = binaryUnsigned(bytes,shoff + target * 64 + 32,8)
+                if(location < 0 || location > targetSize || width > targetSize - location) { throw "nanoc: ELF relocation offset out of bounds" }
+                if(relocationKind != 0) {
+                    var name = copy(arrays.at(symbolNames,symbolIndex))
+                    if(name == "") { throw "nanoc: native relocation references discarded or null symbol" }
+                    arrays.push(O.relocations,NativeRelocation(arrays.at(sectionMap,target),location + arrays.at(sectionBases,target),copy(name),relocationKind,binaryUnsigned(bytes,position + 16,8)))
+                }
+                ri = ri + 1
+            }
+        }
+        index = index + 1
+    }
+    return O
+}
+
+fun nativeLibraryExports(view string path, view mut array[string] functions, view mut array[string] objects) {
+    var bytes = binaryRead(path)
+    nativeValidateElf(bytes,3)
+    var shoff = binaryUnsigned(bytes,40,8)
+    var count = binaryUnsigned(bytes,60,2)
+    var found = false
+    var versionOffset = -1
+    var versionSize = 0
+    var index = 0
+    while(index < count) {
+        var header = shoff + index * 64
+        if(binaryUnsigned(bytes,header + 4,4) == 1879048191) {
+            versionOffset = binaryUnsigned(bytes,header + 24,8)
+            versionSize = binaryUnsigned(bytes,header + 32,8)
+            nativeRange(bytes,versionOffset,versionSize)
+        }
+        index = index + 1
+    }
+    index = 0
+    while(index < count) {
+        var header = shoff + index * 64
+        if(binaryUnsigned(bytes,header + 4,4) == 11) {
+            found = true
+            var offset = binaryUnsigned(bytes,header + 24,8)
+            var size = binaryUnsigned(bytes,header + 32,8)
+            var link = binaryUnsigned(bytes,header + 40,4)
+            if(link >= count || binaryUnsigned(bytes,header + 56,8) != 24 || size % 24 != 0) { throw "nanoc: invalid shared library symbols" }
+            nativeRange(bytes,offset,size)
+            var stringsHeader = shoff + link * 64
+            if(binaryUnsigned(bytes,stringsHeader + 4,4) != 3) { throw "nanoc: invalid shared library string table" }
+            var stringsOffset = binaryUnsigned(bytes,stringsHeader + 24,8)
+            var stringsSize = binaryUnsigned(bytes,stringsHeader + 32,8)
+            nativeRange(bytes,stringsOffset,stringsSize)
+            var si = 0
+            while(si < size / 24) {
+                var position = offset + si * 24
+                var info = binaryUnsigned(bytes,position + 4,1)
+                var visibility = binaryUnsigned(bytes,position + 5,1) & 3
+                var defaultVersion = true
+                if(versionOffset >= 0) {
+                    if(si * 2 + 2 > versionSize) { throw "nanoc: truncated shared library symbol versions" }
+                    defaultVersion = (binaryUnsigned(bytes,versionOffset + si * 2,2) & 32768) == 0
+                }
+                if(defaultVersion && binaryUnsigned(bytes,position + 6,2) != 0 && (info >> 4) != 0 && (visibility == 0 || visibility == 3)) {
+                    var nameOffset = binaryUnsigned(bytes,position,4)
+                    if(nameOffset >= stringsSize) { throw "nanoc: shared library symbol name out of bounds" }
+                    var name = nativeReadString(bytes,stringsOffset + nameOffset,stringsOffset + stringsSize)
+                    if((info & 15) == 2 || (info & 15) == 10) { arrays.push(functions,copy(name)) } else if((info & 15) == 1 || (info & 15) == 6) { arrays.push(objects,copy(name)) }
+                }
+                si = si + 1
+            }
+        }
+        index = index + 1
+    }
+    if(found == false) { throw "nanoc: shared library lacks a dynamic symbol table: " + copy(path) }
+}
+fun nativeFindLibrary(view string name, view array[string] directories) -> string {
+    var array[string] standard = ["/lib/x86_64-linux-gnu","/usr/lib/x86_64-linux-gnu","/lib64","/usr/lib64","/lib","/usr/lib"]
+    var paths = copy(directories)
+    var index = 0
+    while(index < arrays.length(standard)) { arrays.push(paths,arrays.at(standard,index)); index = index + 1 }
+    index = 0
+    while(index < arrays.length(paths)) {
+        var filename = arrays.at(paths,index) + "/lib" + copy(name) + ".so"
+        if(name == "c") { filename = arrays.at(paths,index) + "/libc.so.6" }
+        if(name == "m") { filename = arrays.at(paths,index) + "/libm.so.6" }
+        if(sys.exists(filename)) { return filename }
+        index = index + 1
+    }
+    throw "nanoc: cannot locate native shared library " + copy(name)
+}
+fun nativeProgramHeader(view mut array[int] bytes, int kind, int flags, int offset, int address, int fileSize, int memorySize, int alignment) {
+    binaryAppend(bytes,kind,4); binaryAppend(bytes,flags,4); binaryAppend(bytes,offset,8)
+    binaryAppend(bytes,address,8); binaryAppend(bytes,address,8)
+    binaryAppend(bytes,fileSize,8); binaryAppend(bytes,memorySize,8); binaryAppend(bytes,alignment,8)
+}
+fun nativeDynamicEntry(view mut array[int] bytes, int tag, int value) {
+    binaryAppend(bytes,tag,8); binaryAppend(bytes,value,8)
+}
+fun nativeApplyRelocation(view mut array[int] bytes, int offset, int kind, int symbol, int addend, int place) {
+    var width = nativeRelocationWidth(kind)
+    if(kind == 0) { return; }
+    var value = symbol + addend
+    if(kind == 2 || kind == 4) { value = value - place }
+    if((kind == 2 || kind == 4 || kind == 11) && (value < -2147483648 || value > 2147483647)) { throw "nanoc: native signed relocation overflow" }
+    if(kind == 10 && (value < 0 || value > 4294967295)) { throw "nanoc: native unsigned relocation overflow" }
+    binaryPatch(bytes,offset,value,width)
+}
+fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[string] libraries) {
+    var array[string] functions = []
+    var array[string] objects = []
+    var libraryIndex = 0
+    while(libraryIndex < arrays.length(libraries)) {
+        nativeLibraryExports(arrays.at(libraries,libraryIndex),functions,objects)
+        libraryIndex = libraryIndex + 1
+    }
+    var array[string] imports = []
+    var array[int] importSymbols = []
+    var index = 0
+    while(index < arrays.length(O.symbols)) {
+        view var symbol = O.symbols[index]
+        if(symbol.section == 0) {
+            if(symbol.kind == 1 || symbol.kind == 6) { throw "nanoc: native data/TLS imports are unsupported: " + copy(symbol.name) }
+            if(arrays.index_of(functions,symbol.name) < 0) {
+                if(arrays.index_of(objects,symbol.name) >= 0) { throw "nanoc: native data/TLS imports are unsupported: " + copy(symbol.name) }
+                throw "nanoc: unresolved native symbol " + copy(symbol.name)
+            }
+            arrays.push(imports,copy(symbol.name))
+            arrays.push(importSymbols,index)
+        }
+        index = index + 1
+    }
+    var start = -1
+    var mainIndex = -1
+    index = 0
+    while(index < arrays.length(O.symbols)) {
+        if(O.symbols[index].name == "_start" && O.symbols[index].section != 0) { start = index }
+        if(O.symbols[index].name == "main" && O.symbols[index].section != 0 && O.symbols[index].kind == 2) { mainIndex = index }
+        index = index + 1
+    }
+    if(start < 0 || mainIndex < 0) { throw "nanoc: native executable requires main and generated startup" }
+    var interpreter = "/lib64/ld-linux-x86-64.so.2"
+    if(sys.exists(interpreter) == false) { interpreter = "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" }
+    if(sys.exists(interpreter) == false) { throw "nanoc: x86-64 glibc dynamic loader not found" }
+    var interp = NativeSection(".interp",2); nativeString(interp.bytes,interpreter)
+    var hash = NativeSection(".hash",2); hash.kind = 5; hash.alignment = 8
+    var dynsym = NativeSection(".dynsym",2); dynsym.kind = 11; dynsym.alignment = 8
+    var dynstr = NativeSection(".dynstr",2); dynstr.kind = 3; dynstr.bytes = [0]
+    var rela = NativeSection(".rela.dyn",2); rela.kind = 4; rela.alignment = 8
+    var got = NativeSection(".got",3); got.alignment = 8
+    var dynamic = NativeSection(".dynamic",3); dynamic.kind = 6; dynamic.alignment = 8
+    var array[int] needed = []
+    libraryIndex = 0
+    while(libraryIndex < arrays.length(libraries)) {
+        // Absolute DT_NEEDED entries avoid assuming an unconfigured search path.
+        var library = copy(arrays.at(libraries,libraryIndex))
+        if(strings.starts_with(copy(library),"/") == false) { library = sys.cwd() + "/" + library }
+        arrays.push(needed,nativeString(dynstr.bytes,library))
+        libraryIndex = libraryIndex + 1
+    }
+    nativeSymbolEntry(dynsym.bytes,0,0,0,0,0,0)
+    index = 0
+    var array[int] stubs = []
+    O.current = 1
+    while(index < arrays.length(imports)) {
+        arrays.push(stubs,nativeOffset(O))
+        nativeByte(O,255); nativeByte(O,37); nativeWord(O,0,4)
+        nativeSymbolEntry(dynsym.bytes,nativeString(dynstr.bytes,arrays.at(imports,index)),1,2,0,0,0)
+        binaryAppend(got.bytes,0,8)
+        // Fill RELA addresses once segment offsets are final.
+        binaryAppend(rela.bytes,0,8); binaryAppend(rela.bytes,((index + 1) << 32) | 6,8); binaryAppend(rela.bytes,0,8)
+        index = index + 1
+    }
+    binaryAppend(hash.bytes,1,4); binaryAppend(hash.bytes,arrays.length(imports) + 1,4)
+    var first = 0
+    if(arrays.length(imports) > 0) { first = 1 }
+    binaryAppend(hash.bytes,first,4); binaryAppend(hash.bytes,0,4)
+    index = 1
+    while(index <= arrays.length(imports)) {
+        var next = index + 1
+        if(index == arrays.length(imports)) { next = 0 }
+        binaryAppend(hash.bytes,next,4)
+        index = index + 1
+    }
+    var array[NativeSection] sections = []
+    arrays.push(sections,interp); arrays.push(sections,O.sections[0]); arrays.push(sections,O.sections[2])
+    arrays.push(sections,hash); arrays.push(sections,dynsym); arrays.push(sections,dynstr); arrays.push(sections,rela)
+    arrays.push(sections,O.sections[1]); arrays.push(sections,got); arrays.push(sections,dynamic)
+    var names = NativeSection(".shstrtab",0); names.kind = 3; names.bytes = [0]
+    arrays.push(sections,names)
+    var array[int] nameOffsets = []
+    index = 0
+    while(index < arrays.length(sections)) { arrays.push(nameOffsets,nativeString(names.bytes,sections[index].name)); index = index + 1 }
+    var baseAddress = 4194304
+    var array[int] bytes = []
+    nativeHeader(bytes,2,0,64,0,6,12,11)
+    // Reserve the six program headers.
+    index = 0
+    while(index < 336) { arrays.push(bytes,0); index = index + 1 }
+    var array[int] offsets = []
+    index = 0
+    var readSize = 0
+    var writeOffset = 0
+    while(index < 10) {
+        view var section = sections[index]
+        if(index == 7) { readSize = arrays.length(bytes); binaryAlign(bytes,4096); writeOffset = arrays.length(bytes) }
+        binaryAlign(bytes,section.alignment)
+        arrays.push(offsets,arrays.length(bytes))
+        // .dynamic is populated below, with fixed size computed from tag count.
+        if(index == 9) {
+            var size = (arrays.length(needed) + 10) * 16
+            var bi = 0
+            while(bi < size) { arrays.push(bytes,0); bi = bi + 1 }
+        } else { nativeConcat(bytes,section.bytes) }
+        index = index + 1
+    }
+    var writeSize = arrays.length(bytes) - writeOffset
+    var array[int] sectionAddresses = [baseAddress + arrays.at(offsets,1),baseAddress + arrays.at(offsets,7),baseAddress + arrays.at(offsets,2)]
+    index = 0
+    while(index < arrays.length(imports)) {
+        var stub = arrays.at(stubs,index)
+        var stubAddress = arrays.at(sectionAddresses,0) + stub
+        var gotAddress = baseAddress + arrays.at(offsets,8) + index * 8
+        binaryPatch(bytes,arrays.at(offsets,1) + stub + 2,gotAddress - stubAddress - 6,4)
+        binaryPatch(bytes,arrays.at(offsets,6) + index * 24,gotAddress,8)
+        view mut var symbol = O.symbols[arrays.at(importSymbols,index)]
+        symbol.section = 1; symbol.value = stub; symbol.kind = 2
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(O.relocations)) {
+        view var relocation = O.relocations[index]
+        var si = 0
+        while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
+        if(si == arrays.length(O.symbols)) { throw "nanoc: missing native relocation symbol " + copy(relocation.symbol) }
+        view var symbol = O.symbols[si]
+        if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native relocation" }
+        var symbolAddress = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
+        var sectionOffset = arrays.at(offsets,1)
+        if(relocation.section == 2) { sectionOffset = arrays.at(offsets,7) }
+        if(relocation.section == 3) { sectionOffset = arrays.at(offsets,2) }
+        var location = sectionOffset + relocation.offset
+        nativeApplyRelocation(bytes,location,relocation.kind,symbolAddress,relocation.addend,baseAddress + location)
+        index = index + 1
+    }
+    libraryIndex = 0
+    while(libraryIndex < arrays.length(needed)) { nativeDynamicEntry(dynamic.bytes,1,arrays.at(needed,libraryIndex)); libraryIndex = libraryIndex + 1 }
+    nativeDynamicEntry(dynamic.bytes,4,baseAddress + arrays.at(offsets,3))
+    nativeDynamicEntry(dynamic.bytes,5,baseAddress + arrays.at(offsets,5))
+    nativeDynamicEntry(dynamic.bytes,6,baseAddress + arrays.at(offsets,4))
+    nativeDynamicEntry(dynamic.bytes,10,arrays.length(dynstr.bytes))
+    nativeDynamicEntry(dynamic.bytes,11,24)
+    nativeDynamicEntry(dynamic.bytes,7,baseAddress + arrays.at(offsets,6))
+    nativeDynamicEntry(dynamic.bytes,8,arrays.length(rela.bytes))
+    nativeDynamicEntry(dynamic.bytes,9,24)
+    nativeDynamicEntry(dynamic.bytes,24,0)
+    nativeDynamicEntry(dynamic.bytes,0,0)
+    index = 0
+    while(index < arrays.length(dynamic.bytes)) { bytes[arrays.at(offsets,9) + index] = arrays.at(dynamic.bytes,index); index = index + 1 }
+    var entry = arrays.at(sectionAddresses,0) + O.symbols[start].value
+    binaryPatch(bytes,24,entry,8)
+    var array[int] programs = []
+    nativeProgramHeader(programs,6,4,64,baseAddress + 64,336,336,8)
+    nativeProgramHeader(programs,3,4,arrays.at(offsets,0),baseAddress + arrays.at(offsets,0),arrays.length(interp.bytes),arrays.length(interp.bytes),1)
+    nativeProgramHeader(programs,1,5,0,baseAddress,readSize,readSize,4096)
+    nativeProgramHeader(programs,1,6,writeOffset,baseAddress + writeOffset,writeSize,writeSize,4096)
+    nativeProgramHeader(programs,2,6,arrays.at(offsets,9),baseAddress + arrays.at(offsets,9),arrays.length(dynamic.bytes),arrays.length(dynamic.bytes),8)
+    nativeProgramHeader(programs,1685382481,6,0,0,0,0,16)
+    index = 0
+    while(index < arrays.length(programs)) { bytes[64 + index] = arrays.at(programs,index); index = index + 1 }
+    arrays.push(offsets,arrays.length(bytes)); nativeConcat(bytes,names.bytes)
+    binaryAlign(bytes,8); binaryPatch(bytes,40,arrays.length(bytes),8)
+    nativeSectionHeader(bytes,0,0,0,0,0,0,0,0,0,0)
+    index = 0
+    while(index < arrays.length(sections)) {
+        view var section = sections[index]
+        var link = 0; var info = 0; var entrySize = 0
+        if(index == 3) { link = 5; entrySize = 4 }
+        if(index == 4) { link = 6; info = 1; entrySize = 24 }
+        if(index == 6) { link = 5; entrySize = 24 }
+        if(index == 9) { link = 6; entrySize = 16 }
+        var address = 0
+        if(index < 10) { address = baseAddress + arrays.at(offsets,index) }
+        nativeSectionHeader(bytes,arrays.at(nameOffsets,index),section.kind,section.flags,address,arrays.at(offsets,index),arrays.length(section.bytes),link,info,section.alignment,entrySize)
+        index = index + 1
+    }
+    binaryWrite(path,bytes,true)
+}
+fun nativeLink(view mut NativeObject O, view string path, view array[string] libraries) {
+    var index = 0
+    while(index < arrays.length(O.symbols)) {
+        if(O.symbols[index].name == "_start" && O.symbols[index].section != 0) { throw "nanoc: _start is reserved by native startup" }
+        index = index + 1
+    }
+    var startup = nativeAssemble(".text\n.globl _start\n.type _start, @function\n_start:\nxorl %ebp, %ebp\nmovq %rdx, %r9\npopq %rsi\nmovq %rsp, %rdx\nandq $-16, %rsp\npushq %rax\npushq %rsp\nxorl %r8d, %r8d\nxorl %ecx, %ecx\nleaq main(%rip), %rdi\ncall __libc_start_main\nhlt\n")
+    nativeMerge(O,startup,-1)
+    nativeWriteExecutable(O,path,libraries)
+}

@@ -22,6 +22,7 @@ fun compilerAdd(view mut Compiler C, view Symbol S) {
     var old = compilerFind(C, S.name)
     if (old >= 0) {
         var prior = arrays.at(C.globals, old)
+        prior.linkName = copy(S.linkName)
         prior.name = copy(S.name)
         prior.ctype = copy(S.ctype)
         prior.line = S.line
@@ -163,6 +164,7 @@ fun parseBaseType(view mut Cursor C) -> string {
     }
     if (C.isWord("long")) {
         C.take()
+        if (C.isWord("double")) { C.take(); return "f80" }
         if (C.isWord("long")) {
             C.take()
         }
@@ -215,7 +217,7 @@ fun parseBaseType(view mut Cursor C) -> string {
     if (t.text == "float") { return "f32" }
     if (t.text == "double") { return "f64" }
     if (t.text == "_Bool") { return "u8" }
-    if (t.text == "__builtin_va_list" || t.text == "__gnuc_va_list" || t.text == "va_list") { return "*i8" }
+    if (t.text == "__builtin_va_list" || t.text == "__gnuc_va_list" || t.text == "va_list") { return "[3 x u64]" }
     if (t.text == "FILE") { return "%s.__nanoc_FILE" }
     if (t.text == "size_t" || t.text == "fpos_t" || t.text == "ptrdiff_t" || t.text == "ssize_t") { return "u64" }
     if (t.text == "wchar_t") { return "i32" }
@@ -258,6 +260,7 @@ fun parseBaseType(view mut Cursor C) -> string {
 }
 
 class Decl {
+    var bool internal
     var string name
     var string ctype
     var bool function
@@ -266,6 +269,7 @@ class Decl {
     var bool variadic
 
     fun init(string name, string ctype) {
+        this.internal = false
         this.name = name
         this.ctype = ctype
         this.function = false
@@ -275,11 +279,34 @@ class Decl {
     }
 }
 
+fun parseArraySuffix(view mut Cursor C, string ty) -> string {
+    var array[int] dimensions = []
+    while (C.isPunct("[")) {
+        C.take()
+        var length = 0
+        if (C.isPunct("]") == false) {
+            var bound = C.take()
+            if (bound.kind != "num" || bound.ival <= 0) { parseFail(C, "array bound must be a positive integer constant") }
+            length = bound.ival
+        }
+        expectPunct(C, "]")
+        arrays.push(dimensions, length)
+    }
+    var index = arrays.length(dimensions) - 1
+    while (index >= 0) {
+        if (index > 0 && arrays.at(dimensions, index) == 0) { parseFail(C, "only the outer array bound may be omitted") }
+        ty = "[" + ("" + arrays.at(dimensions, index)) + " x " + ty + "]"
+        index = index - 1
+    }
+    return ty
+}
+
 fun parseDeclarator(view mut Cursor C, string base) -> Decl {
     var ty = base
     while (C.isPunct("*")) {
         C.take()
         ty = "*" + ty
+        while (C.isWord("const") || C.isWord("volatile") || C.isWord("restrict")) { C.take() }
     }
     if (C.isPunct("(")) {
         C.take()
@@ -325,6 +352,10 @@ fun parseDeclarator(view mut Cursor C, string base) -> Decl {
             inner.paramNames = copy(fnames)
             inner.variadic = fvariadic
             inner.ctype = "*" + makeFunctionType(copy(fparams), fvariadic, copy(returnTy))
+        }
+        if (C.isPunct("[")) {
+            if (tyIsPointer(inner.ctype) == false) { parseFail(C, "parenthesized array declarator requires a pointer") }
+            inner.ctype = "*" + parseArraySuffix(C, pointee(inner.ctype))
         }
         return inner
     }
@@ -374,18 +405,7 @@ fun parseDeclarator(view mut Cursor C, string base) -> Decl {
         var sig = makeFunctionType(copy(D.params), D.variadic, copy(sigRet))
         D.ctype = sig
     }
-    while (C.isPunct("[")) {
-        C.take()
-        var n = C.take()
-        if (n.kind != "num") {
-            parseFail(C, "array bound must be an integer constant")
-        }
-        if (C.isPunct("]") == false) {
-            parseFail(C, "expected ']' after array bound")
-        }
-        C.take()
-        D.ctype = "[" + n.text + " x " + D.ctype + "]"
-    }
+    D.ctype = parseArraySuffix(C, copy(D.ctype))
     return D
 }
 
@@ -475,7 +495,7 @@ fun parseStructDefinition(view mut Compiler C, view mut Cursor P) -> int {
     var al = 1
     var bitCursor = 0
     while (i < arrays.length(S.fieldTypes)) {
-        var ft2 = arrays.at(S.fieldTypes, i)
+        var ft2 = copy(arrays.at(S.fieldTypes, i))
         var bits2 = arrays.at(S.fieldBits, i)
         if (bits2 > 0) {
             if (bitCursor == 0) {
@@ -529,7 +549,7 @@ fun parseUnionDefinition(view mut Compiler C, view mut Cursor P) -> int {
     var size = 0
     var al = 1
     while (i < arrays.length(U.fieldTypes)) {
-        var ft2 = arrays.at(U.fieldTypes, i)
+        var ft2 = copy(arrays.at(U.fieldTypes, i))
         size = maxInt(size, tySize(C, ft2))
         al = maxInt(al, tyAlign(C, ft2))
         i = i + 1

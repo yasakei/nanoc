@@ -1,0 +1,55 @@
+#ifndef NANOC_AGGREGATE_ABI_H
+#define NANOC_AGGREGATE_ABI_H
+struct Pair { long first; long second; };
+struct Reals { double first; double second; };
+struct Mixed { long integer; double real; };
+struct Reverse { double real; long integer; };
+struct Large { long first; long second; long third; };
+struct Floats { float first; float second; float third; };
+struct Bytes { char first; char second; char third; };
+struct Single { float real; int integer; };
+struct Tail { double real; char first; char second; char third; };
+struct Embedded { float values[3]; int tag; };
+struct Nested { struct Mixed inner; };
+union Word { double real; long integer; };
+
+struct Pair local_pair(struct Pair value, long increment);
+struct Pair host_pair(struct Pair value, long increment);
+struct Reals local_reals(struct Reals value, double increment);
+struct Reals host_reals(struct Reals value, double increment);
+struct Mixed local_mixed_record(struct Mixed value, int increment);
+struct Mixed host_mixed_record(struct Mixed value, int increment);
+struct Reverse local_reverse(struct Reverse value);
+struct Reverse host_reverse(struct Reverse value);
+struct Large local_large(struct Large value, long increment);
+struct Large host_large(struct Large value, long increment);
+struct Floats local_floats_record(struct Floats value);
+struct Floats host_floats_record(struct Floats value);
+struct Bytes local_bytes(struct Bytes value);
+struct Bytes host_bytes(struct Bytes value);
+struct Single local_single(struct Single value);
+struct Single host_single(struct Single value);
+struct Tail local_tail(struct Tail value);
+struct Tail host_tail(struct Tail value);
+struct Embedded local_embedded(struct Embedded value);
+struct Embedded host_embedded(struct Embedded value);
+struct Nested local_nested(struct Nested value);
+struct Nested host_nested(struct Nested value);
+union Word local_word(union Word value);
+union Word host_word(union Word value);
+long local_exhaust(long a, long b, long c, long d, long e, struct Pair pair, long last);
+long host_exhaust(long a, long b, long c, long d, long e, struct Pair pair, long last);
+long local_float_exhaust(double a, double b, double c, double d, double e, double f, double g, struct Reals pair, long last);
+long host_float_exhaust(double a, double b, double c, double d, double e, double f, double g, struct Reals pair, long last);
+long local_named_varargs(struct Pair pair, int count, ...);
+long host_named_varargs(struct Pair pair, int count, ...);
+long local_large_varargs(struct Large value, int count, ...);
+long host_large_varargs(struct Large value, int count, ...);
+long local_aggregate_varargs(int marker, ...);
+long host_aggregate_varargs(int marker, ...);
+long local_aggregate_overflow(long a, long b, long c, long d, long e, ...);
+long host_aggregate_overflow(long a, long b, long c, long d, long e, ...);
+struct Large local_variadic_return(int marker, ...);
+struct Large host_variadic_return(int marker, ...);
+int host_calls_aggregates(void);
+#endif

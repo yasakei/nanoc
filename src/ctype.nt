@@ -32,7 +32,20 @@ class StructInfo {
     }
 }
 
+fun copyStructInfo(view StructInfo source) -> StructInfo {
+    var saved = StructInfo(copy(source.name))
+    saved.isUnion = source.isUnion
+    saved.fieldNames = copy(source.fieldNames)
+    saved.fieldTypes = copy(source.fieldTypes)
+    saved.fieldBits = copy(source.fieldBits)
+    saved.fieldBitOffsets = copy(source.fieldBitOffsets)
+    saved.size = source.size
+    saved.align = source.align
+    return saved
+}
+
 class Symbol {
+    var string linkName
     var string name
     var string ctype
     var int line
@@ -41,6 +54,7 @@ class Symbol {
     var array[string] params
 
     fun init(string name, string ctype, int line) {
+        this.linkName = copy(name)
         this.name = name
         this.ctype = ctype
         this.line = line
@@ -75,7 +89,7 @@ fun structInfoOf(view Compiler C, view string name) -> StructInfo {
     while (i < arrays.length(C.structs)) {
         var S = arrays.at(C.structs, i)
         if (S.name == name) {
-            return copy(S)
+            return copyStructInfo(S)
         }
         i = i + 1
     }
@@ -87,7 +101,7 @@ fun tyIsUnsigned(view string t) -> bool {
 }
 
 fun tyIsFloat(view string t) -> bool {
-    return t == "f32" || t == "f64"
+    return t == "f32" || t == "f64" || t == "f80"
 }
 
 fun tyIsPointer(view string t) -> bool {
@@ -108,14 +122,10 @@ fun tyIsArray(view string t) -> bool {
 }
 
 fun tyIsStruct(view string t) -> bool {
-    if (tyIsPointer(t)) {
-        return tyIsStruct(pointee(t))
-    }
     return strings.substring(copy(t), 0, 2) == "%s"
 }
 
 fun tyIsUnion(view string t) -> bool {
-    if (tyIsPointer(t)) { return tyIsUnion(pointee(t)) }
     return strings.substring(copy(t), 0, 2) == "%u"
 }
 
@@ -162,6 +172,7 @@ fun tySize(view Compiler C, view string t) -> int {
     if (t == "i8" || t == "u8") { return 1 }
     if (t == "i16" || t == "u16") { return 2 }
     if (t == "i32" || t == "u32" || t == "f32") { return 4 }
+    if (t == "f80") { return 16 }
     if (t == "i64" || t == "u64" || t == "f64") { return 8 }
     if (tyIsPointer(t)) { return 8 }
     if (t == "void") { return 1 }
@@ -177,6 +188,7 @@ fun tyAlign(view Compiler C, view string t) -> int {
     if (t == "i8" || t == "u8") { return 1 }
     if (t == "i16" || t == "u16") { return 2 }
     if (t == "i32" || t == "u32" || t == "f32") { return 4 }
+    if (t == "f80") { return 16 }
     if (t == "i64" || t == "u64" || t == "f64" || tyIsPointer(t)) { return 8 }
     if (tyIsArray(t)) { return tyAlign(C, elemTy(t)) }
     if (tyIsStruct(t) || tyIsUnion(t)) {
