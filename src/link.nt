@@ -80,7 +80,9 @@ fun nativeMerge(view mut NativeObject target, view NativeObject source, int obje
     }
 }
 fun nativeReadObject(view string path) -> NativeObject {
-    var bytes = binaryRead(path)
+    return nativeReadObjectBytes(binaryRead(path))
+}
+fun nativeReadObjectBytes(view array[int] bytes) -> NativeObject {
     nativeValidateElf(bytes,1)
     var O = NativeObject()
     var shoff = binaryUnsigned(bytes,40,8)
@@ -277,7 +279,7 @@ fun nativeLibraryExports(view string path, view mut array[string] functions, vie
     }
     if(found == false) { throw "nanoc: shared library lacks a dynamic symbol table: " + copy(path) }
 }
-fun nativeFindLibrary(view string name, view array[string] directories) -> string {
+fun nativeFindLibrary(view string name, view array[string] directories, bool allowArchive) -> string {
     var array[string] standard = ["/lib/x86_64-linux-gnu","/usr/lib/x86_64-linux-gnu","/lib64","/usr/lib64","/lib","/usr/lib"]
     var paths = copy(directories)
     var index = 0
@@ -288,9 +290,13 @@ fun nativeFindLibrary(view string name, view array[string] directories) -> strin
         if(name == "c") { filename = arrays.at(paths,index) + "/libc.so.6" }
         if(name == "m") { filename = arrays.at(paths,index) + "/libm.so.6" }
         if(sys.exists(filename)) { return filename }
+        if(allowArchive) {
+            filename = arrays.at(paths,index) + "/lib" + copy(name) + ".a"
+            if(sys.exists(filename)) { return filename }
+        }
         index = index + 1
     }
-    throw "nanoc: cannot locate native shared library " + copy(name)
+    throw "nanoc: cannot locate native library " + copy(name)
 }
 fun nativeProgramHeader(view mut array[int] bytes, int kind, int flags, int offset, int address, int fileSize, int memorySize, int alignment) {
     binaryAppend(bytes,kind,4); binaryAppend(bytes,flags,4); binaryAppend(bytes,offset,8)

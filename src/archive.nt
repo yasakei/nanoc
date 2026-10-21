@@ -1,0 +1,184 @@
+// Read archive members directly; neither extraction nor symbol selection uses ar.
+use "link.nt"
+
+class NativeArchiveMember {
+    var string name
+    var array[int] bytes
+    var array[string] exports
+    fun init(string name, array[int] bytes, array[string] exports) {
+        this.name = name
+        this.bytes = bytes
+        this.exports = exports
+    }
+}
+fun nativeArchiveText(view array[int] bytes, int offset, int size) -> string {
+    nativeRange(bytes,offset,size)
+    var text = ""
+    var index = 0
+    while(index < size) {
+        var value = arrays.at(bytes,offset + index)
+        if(value == 0) { throw "nanoc: NUL byte in archive header/name" }
+        text = text + strings.from_char_code(value)
+        index = index + 1
+    }
+    return text
+}
+fun nativeArchiveDecimal(view string spelling) -> int {
+    var text = strings.trim(copy(spelling))
+    if(text == "") { throw "nanoc: empty archive decimal field" }
+    var value = 0
+    var index = 0
+    while(index < strings.length(copy(text))) {
+        var digit = strings.char_code(copy(text),index) - 48
+        if(digit < 0 || digit > 9 || value > (16777216 - digit) / 10) { throw "nanoc: invalid or excessive archive decimal field" }
+        value = value * 10 + digit
+        index = index + 1
+    }
+    return value
+}
+fun nativeArchiveSlice(view array[int] bytes, int offset, int size) -> array[int] {
+    nativeRange(bytes,offset,size)
+    var array[int] resultBytes = []
+    var index = 0
+    while(index < size) { arrays.push(resultBytes,arrays.at(bytes,offset + index)); index = index + 1 }
+    return resultBytes
+}
+// Inspect only definitions during selection. Unsupported relocations in an
+// unused member must not cause errors, but a selected member is fully validated.
+fun nativeArchiveExports(view array[int] bytes) -> array[string] {
+    nativeValidateElf(bytes,1)
+    var array[string] exports = []
+    var shoff = binaryUnsigned(bytes,40,8)
+    var count = binaryUnsigned(bytes,60,2)
+    var found = false
+    var index = 0
+    while(index < count) {
+        var header = shoff + index * 64
+        if(binaryUnsigned(bytes,header + 4,4) == 2) {
+            if(found) { throw "nanoc: multiple archive member symbol tables are unsupported" }
+            found = true
+            var offset = binaryUnsigned(bytes,header + 24,8)
+            var size = binaryUnsigned(bytes,header + 32,8)
+            var link = binaryUnsigned(bytes,header + 40,4)
+            if(link >= count || binaryUnsigned(bytes,header + 56,8) != 24 || size % 24 != 0) { throw "nanoc: invalid archive member symbol table" }
+            nativeRange(bytes,offset,size)
+            var stringsHeader = shoff + link * 64
+            if(binaryUnsigned(bytes,stringsHeader + 4,4) != 3) { throw "nanoc: invalid archive member symbol strings" }
+            var stringsOffset = binaryUnsigned(bytes,stringsHeader + 24,8)
+            var stringsSize = binaryUnsigned(bytes,stringsHeader + 32,8)
+            nativeRange(bytes,stringsOffset,stringsSize)
+            var si = 1
+            while(si < size / 24) {
+                var position = offset + si * 24
+                var info = binaryUnsigned(bytes,position + 4,1)
+                var section = binaryUnsigned(bytes,position + 6,2)
+                if((info >> 4) != 0 && section != 0 && (info & 15) != 4) {
+                    var nameOffset = binaryUnsigned(bytes,position,4)
+                    if(nameOffset >= stringsSize) { throw "nanoc: archive member symbol name out of bounds" }
+                    var name = nativeReadString(bytes,stringsOffset + nameOffset,stringsOffset + stringsSize)
+                    if(name != "") { arrays.push(exports,copy(name)) }
+                }
+                si = si + 1
+            }
+        }
+        index = index + 1
+    }
+    if(found == false) { throw "nanoc: archive member has no ELF symbol table" }
+    return exports
+}
+fun nativeReadArchive(view string path) -> array[NativeArchiveMember] {
+    var bytes = binaryRead(path)
+    nativeRange(bytes,0,8)
+    var magic = nativeArchiveText(bytes,0,8)
+    if(magic == "!<thin>\n") { throw "nanoc: native thin archives are unsupported: " + copy(path) }
+    if(magic != "!<arch>\n") { throw "nanoc: invalid native archive magic: " + copy(path) }
+    var array[NativeArchiveMember] members = []
+    var array[int] names = []
+    var cursor = 8
+    while(cursor < arrays.length(bytes)) {
+        nativeRange(bytes,cursor,60)
+        if(nativeArchiveText(bytes,cursor + 58,2) != "`\n") { throw "nanoc: invalid native archive member header" }
+        var name = strings.trim(nativeArchiveText(bytes,cursor,16))
+        var size = nativeArchiveDecimal(nativeArchiveText(bytes,cursor + 48,10))
+        var payload = cursor + 60
+        nativeRange(bytes,payload,size)
+        var next = payload + size
+        if(next % 2 != 0) {
+            nativeRange(bytes,next,1)
+            if(arrays.at(bytes,next) != 10) { throw "nanoc: invalid native archive padding" }
+            next = next + 1
+        }
+        cursor = next
+        if(name == "/" || name == "/SYM64/") { continue }
+        if(name == "//") {
+            if(arrays.length(names) != 0) { throw "nanoc: duplicate native archive long-name table" }
+            names = nativeArchiveSlice(bytes,payload,size)
+            continue
+        }
+        if(strings.starts_with(copy(name),"#1/")) {
+            var nameSize = nativeArchiveDecimal(strings.substring(copy(name),3,strings.length(copy(name))))
+            if(nameSize <= 0 || nameSize > size || nameSize > 4095) { throw "nanoc: invalid BSD archive member name size" }
+            // BSD extended names may be padded with NULs inside the payload.
+            var end = 0
+            while(end < nameSize && arrays.at(bytes,payload + end) != 0) { end = end + 1 }
+            name = nativeArchiveText(bytes,payload,end)
+            var padding = end
+            while(padding < nameSize) {
+                if(arrays.at(bytes,payload + padding) != 0) { throw "nanoc: invalid BSD archive name padding" }
+                padding = padding + 1
+            }
+            payload = payload + nameSize
+            size = size - nameSize
+        } else if(strings.starts_with(copy(name),"/")) {
+            var offset = nativeArchiveDecimal(strings.substring(copy(name),1,strings.length(copy(name))))
+            if(offset >= arrays.length(names) || (offset != 0 && arrays.at(names,offset - 1) != 10)) { throw "nanoc: invalid native archive long-name offset" }
+            var end = offset
+            while(end < arrays.length(names) && arrays.at(names,end) != 10) { end = end + 1 }
+            if(end >= arrays.length(names) || end == offset || arrays.at(names,end - 1) != 47 || end - offset > 4096) { throw "nanoc: unterminated native archive long name" }
+            name = nativeArchiveText(names,offset,end - offset - 1)
+        } else {
+            if(name != "" && strings.substring(copy(name),strings.length(copy(name)) - 1,strings.length(copy(name))) == "/") {
+                name = strings.substring(copy(name),0,strings.length(copy(name)) - 1)
+            }
+        }
+        if(name == "__.SYMDEF" || name == "__.SYMDEF SORTED" || name == "__.SYMDEF_64" || name == "__.SYMDEF_64 SORTED") { continue }
+        if(name == "") { throw "nanoc: empty native archive member name" }
+        try {
+            var memberBytes = nativeArchiveSlice(bytes,payload,size)
+            var exports = nativeArchiveExports(memberBytes)
+            arrays.push(members,NativeArchiveMember(copy(name),memberBytes,exports))
+        } catch(err) { throw "nanoc: archive " + copy(path) + "(" + name + "): " + err }
+    }
+    return members
+}
+fun nativeArchiveNeeded(view NativeObject O, view NativeArchiveMember member) -> bool {
+    var index = 0
+    while(index < arrays.length(O.symbols)) {
+        view var symbol = O.symbols[index]
+        if(symbol.section == 0 && arrays.index_of(member.exports,symbol.name) >= 0) { return true }
+        index = index + 1
+    }
+    return false
+}
+fun nativeMergeArchive(view mut NativeObject O, view string path, int objectId) -> int {
+    var members = nativeReadArchive(path)
+    var array[int] selected = []
+    var memberIndex = 0
+    while(memberIndex < arrays.length(members)) { arrays.push(selected,0); memberIndex = memberIndex + 1 }
+    var changed = true
+    while(changed) {
+        changed = false
+        var index = 0
+        while(index < arrays.length(members)) {
+            view var member = members[index]
+            if(arrays.at(selected,index) == 0 && nativeArchiveNeeded(O,member)) {
+                try { nativeMerge(O,nativeReadObjectBytes(member.bytes),objectId) } catch(err) { throw "nanoc: archive " + copy(path) + "(" + copy(member.name) + "): " + err }
+                objectId = objectId + 1
+                selected[index] = 1
+                changed = true
+            }
+            index = index + 1
+        }
+    }
+    return objectId
+}

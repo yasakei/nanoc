@@ -1,0 +1,113 @@
+# Fixture construction may use host ar; nanoc itself runs with an empty PATH.
+task test_archive after build {
+    let workspace = test_workspace("archive")
+    let nanoc = absolute("build/debug/nanoc")
+    let directory = absolute(workspace)
+    let program = directory + "/program"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    let entry_name = "archive_entry_with_a_long_filename"
+    let leaf_name = "archive_leaf_with_a_long_filename"
+    write(workspace + "/" + entry_name + ".c", "int archive_leaf(void); static int value = 17; static int helper(void) { return value; } int archive_entry(void) { return helper() + archive_leaf(); }\n")
+    write(workspace + "/" + leaf_name + ".c", "static int value = 25; static int helper(void) { return value; } int archive_leaf(void) { return helper(); }\n")
+    write(workspace + "/unused.c", "int archive_entry(void) { return 999; } int never_available(void); int unused(void) { return never_available(); }\n")
+    write(workspace + "/main.c", "int archive_entry(void); int main(void) { return archive_entry() - 42; }\n")
+    write(workspace + "/nothing.c", "int main(void) { return 0; }\n")
+    for name in [entry_name, leaf_name, "unused"] {
+        checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/" + name + ".c", "-o", directory + "/" + name + ".o"])
+    }
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/main.c", "-o", directory + "/main.o"])
+    let entry = directory + "/" + entry_name + ".o"
+    let leaf = directory + "/" + leaf_name + ".o"
+    let archive = directory + "/libanswer.a"
+    # Leaf precedes its user, so selection must rescan within this archive.
+    # The duplicate entry in unused.o must NOT be loaded merely because it exists.
+    checked(workspace, "ar", ["rcs", archive, leaf, entry, directory + "/unused.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", archive, "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", "-L", directory, "-lanswer", "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "cc", ["-no-pie", directory + "/main.o", archive, "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/nothing.c", archive, "-o", program])
+    checked(workspace, program, [])
+    checked_in(workspace, "env", [empty_path, nanoc, "--native-link", "main.o", "libanswer.a", "-o", "program"], directory, 0)
+    checked(workspace, program, [])
+
+    # Generated startup supplies an undefined main before archive selection.
+    checked(workspace, "ar", ["rcs", directory + "/libmain.a", directory + "/main.o", leaf, entry])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/libmain.a", "-o", program])
+    checked(workspace, program, [])
+    checked_in(workspace, "env", [empty_path, nanoc, "--native-link", "--", directory + "/main.c", archive], directory, 0)
+    checked(workspace, directory + "/a.out", [])
+    # Member symbol tables suffice even when the archive index is absent.
+    checked(workspace, "ar", ["rcS", directory + "/libunindexed.a", leaf, entry])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libunindexed.a", "-o", program])
+    checked(workspace, program, [])
+
+    # Archive order is significant; only repetition can revisit an earlier file.
+    checked(workspace, "ar", ["rcs", directory + "/libleaf.a", leaf])
+    checked(workspace, "ar", ["rcs", directory + "/libentry.a", entry])
+    let wrong_order = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libleaf.a", directory + "/libentry.a", "-o", rejected], 1)
+    require(contains(wrong_order, "unresolved native symbol archive_leaf"), "archives were globally rescanned")
+    let early = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-L", directory, "-lanswer", directory + "/main.c", "-o", rejected], 1)
+    require(contains(early, "unresolved native symbol archive_entry"), "-l archive position was lost")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libleaf.a", directory + "/libentry.a", directory + "/libleaf.a", "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", "-L" + directory, "-lleaf", "-lentry", "-lleaf", "-o", program])
+    checked(workspace, program, [])
+
+    # Unsupported relocations matter only in members that get selected.
+    write(workspace + "/pic.c", "extern int outside_value; int archive_pic(void) { return outside_value; }\n")
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/pic.c", "-o", directory + "/pic.o"])
+    checked(workspace, "ar", ["rcs", directory + "/libpic.a", directory + "/pic.o", leaf, entry])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libpic.a", "-o", program])
+    checked(workspace, program, [])
+    write(workspace + "/pic-main.c", "int archive_pic(void); int main(void) { return archive_pic(); }\n")
+    let pic = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/pic-main.c", directory + "/libpic.a", "-o", rejected], 1)
+    require(contains(pic, "libpic.a(pic.o)") && contains(pic, "unsupported native relocation type"), "selected unsupported member lacks archive context")
+
+    # Archive members from the host compiler, including local section symbols.
+    checked(workspace, "cc", ["-O2", "-fno-pic", "-fno-pie", "-c", directory + "/" + entry_name + ".c", "-o", directory + "/host-entry.o"])
+    checked(workspace, "cc", ["-O2", "-fno-pic", "-fno-pie", "-c", directory + "/" + leaf_name + ".c", "-o", directory + "/host-leaf.o"])
+    checked(workspace, "ar", ["rcs", directory + "/libhost.a", directory + "/host-leaf.o", directory + "/host-entry.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libhost.a", "-o", program])
+    checked(workspace, program, [])
+
+    # Synthetic BSD extended-name member and odd-length payload padding.
+    # Add one trailing byte if needed; ELF readers ignore unreferenced tail bytes.
+    let bsd = directory + "/libbsd.a"
+    let odd = directory + "/libodd.a"
+    let payload = directory + "/odd.o"
+    let script = "cp " + shell_quote(leaf) + " " + shell_quote(payload) + "; size=$(wc -c < " + shell_quote(payload) + "); if [ $((size % 2)) -eq 0 ]; then printf '\\n' >> " + shell_quote(payload) + "; fi; size=$(wc -c < " + shell_quote(payload) + "); "
+    let odd_header = "printf '!<arch>\\n'; printf '%-16s%-12s%-6s%-6s%-8s%-10s`\\n' leaf.o/ 0 0 0 644 \"$size\"; cat " + shell_quote(payload) + "; printf '\\n'"
+    checked(workspace, "sh", ["-c", script + "{ " + odd_header + "; } > " + shell_quote(odd)])
+    let long_name = "bsd_member_name_with_spaces.o"
+    let bsd_header = "printf '!<arch>\\n'; printf '%-16s%-12s%-6s%-6s%-8s%-10s`\\n' '#1/" + len(long_name) + "' 0 0 0 644 $((size + " + len(long_name) + ")); printf '%s' " + shell_quote(long_name) + "; cat " + shell_quote(payload) + "; if [ $(((size + " + len(long_name) + ") % 2)) -ne 0 ]; then printf '\\n'; fi"
+    checked(workspace, "sh", ["-c", script + "{ " + bsd_header + "; } > " + shell_quote(bsd)])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libentry.a", odd, "-o", program])
+    checked(workspace, program, [])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libentry.a", bsd, "-o", program])
+    checked(workspace, program, [])
+
+    checked(workspace, "ar", ["rcsT", directory + "/libthin.a", leaf])
+    let thin = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libthin.a", "-o", rejected], 1)
+    require(contains(thin, "native thin archives are unsupported"), "thin archive silently fell back")
+    write(workspace + "/invalid.a", "!<arch>\nbroken header")
+    let malformed = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/invalid.a", "-o", rejected], 1)
+    require(contains(malformed, "truncated ELF input"), "truncated archive header was not rejected")
+    write(workspace + "/negative.a", "!<arch>\nmember.o/       0           0     0     644     -1        `\n")
+    let negative = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/negative.a", "-o", rejected], 1)
+    require(contains(negative, "archive"), "negative archive size was not rejected")
+    write(workspace + "/not-object.txt", "not an ELF object\n")
+    checked(workspace, "ar", ["rcS", directory + "/libtext.a", directory + "/not-object.txt"])
+    let text_member = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libtext.a", "-o", rejected], 1)
+    require(contains(text_member, "libtext.a(not-object.txt)"), "non-ELF archive member lacks context")
+    checked(workspace, "ar", ["rcs", directory + "/libempty.a"])
+    let empty = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libempty.a", "-o", rejected], 1)
+    require(contains(empty, "unresolved native symbol archive_entry"), "empty archive fabricated a definition")
+    require(!exists(workspace + "/rejected"), "failed archive links wrote an output")
+    finish_workspace(workspace)
+    print("native archives: lazy members, dependency closure, ordering, GNU/BSD names, no ar fallback: ok")
+}

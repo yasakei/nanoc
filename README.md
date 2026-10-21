@@ -47,6 +47,7 @@ The compiler is written to `build/debug/nanoc`.
 # Native ELF linking (experimental; no cc, as, or ld)
 ./build/debug/nanoc --native-link -o output input.c other.c library.o
 ./build/debug/nanoc --native-link -lm -o output input.c
+./build/debug/nanoc --native-link input.c -L lib -lanswer -o output
 
 # Compile and execute, forwarding arguments and the program's exit status
 ./build/debug/nanoc -run input.c "argument with spaces"
@@ -73,12 +74,27 @@ inputs are supported for function imports; shared-library paths are recorded
 as absolute `DT_NEEDED` entries, so moving/removing those libraries requires
 relinking. This is not yet a portable deployment format.
 
+Static `.a` archives are read directly, without invoking `ar`. GNU short/long
+member names and BSD extended names are supported. The linker loads only
+members needed to resolve undefined symbols, repeating selection within each
+archive to include its dependencies. Archives are searched at their position
+on the command line: put `library.a` or `-lname` **after** its users, and repeat
+an archive if a later archive introduces a dependency back into it.
+`-L dir -lname` prefers a shared library over an archive within each searched
+directory. Archive indexes are optional; member ELF symbol tables drive
+selection.
+
+Thin archives, nested archives, non-ELF members, archive creation, and
+`--whole-archive`/archive groups are not implemented. Unsupported relocations
+in an unused member do not prevent linking; selected members are validated
+fully. Native input files, including archives, are limited to 16 MiB.
+
 Supported object relocations are `R_X86_64_NONE`, `R_X86_64_64`,
 `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_32`, and `R_X86_64_32S`, with
 bounds and 32-bit overflow checks. Unsupported relocations fail explicitly;
 the native linker **never falls back** to the host toolchain.
 
-Archives, PIE, GOT/TLS object relocations, data imports (including `stdout`
+PIE, GOT/TLS object relocations, data imports (including `stdout`
 and `optind`), weak/common/absolute symbols, non-default visibility, linker
 scripts, `-Wl` flags, and constructor/destructor sections are not supported.
 Host objects with GOT relocations may need `-fno-pic -fno-pie`; this does not
@@ -107,12 +123,14 @@ and retain failed-test artifacts for inspection.
 
 Individual suites can be run with `arq test_preprocessor`, `arq test_driver`,
 `arq test_abi`, `arq test_smoke`, `arq test_language`, `arq test_rejections`,
-and `arq test_native`.
+`arq test_native`, and `arq test_archive`.
 Each depends on `build`; a full invocation builds once before the isolated test
 tasks run. The native suite hides the host toolchain with an empty `PATH`,
 checks ELF metadata, compares native and host-linked output, and exercises
 multiple units, shared-library imports, `-run`, scalar/aggregate ABI at `-O0`
 and `-O2`, and explicit failures for unsupported relocations and inputs.
+The archive suite also hides `ar` from nanoc and checks lazy member selection,
+dependency closure, input ordering, long names, padding, and malformed inputs.
 
 Optionally compare the language and aggregate ABI tests with an installed TinyCC:
 
@@ -175,8 +193,9 @@ It targets x86-64 Linux. The default executable path relies on the host
 assembler/linker and libc; `-c` is native and `--native-link` removes the host
 assembler/linker dependency with the restrictions above.
 Broader floating-point expressions, diagnostics, and standards coverage
-remain incomplete; the tested long-double subset is not full standards parity. The aggregate ABI does not yet cover bitfields,
-packed/explicitly aligned records, vectors, or complex numbers.
+remain incomplete; the tested long-double subset is not full standards parity.
+The aggregate ABI does not yet cover bitfields, packed/explicitly aligned
+records, vectors, or complex numbers.
 Variable-length arrays, bitfield initializers,
 brace-elided multidimensional initializers, chained designators, and general
 static floating-point constant expressions are not implemented.
@@ -189,7 +208,7 @@ The native backend is being extended incrementally, with rejection tests for
 unsupported inputs and no implicit host-toolchain fallback. Remaining work
 includes:
 
-- Static archive member selection and native archive linking
+- Thin archives, archive groups, and archive creation
 - GOT relocations and broader host-object compatibility
 - Weak/common/absolute symbols and data imports
 - Constructor/destructor handling and additional ELF validation
