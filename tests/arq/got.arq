@@ -1,0 +1,128 @@
+# Preserve GOT loads/calls rather than requiring instruction relaxation.
+task test_got after build {
+    let workspace = test_workspace("got")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let reference = directory + "/reference"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    let main = directory + "/main.o"
+    let host = directory + "/host.o"
+    checked(workspace, "env", [empty_path, nanoc, "-c", "tests/c/got.c", "-o", main])
+    checked(workspace, "cc", ["-fPIC", "-c", "tests/c/got.c", "-o", directory + "/reference-main.o"])
+    for optimization in ["-O0", "-O2"] {
+        for mode in ["pic", "no-plt", "no-relax"] {
+            if mode == "pic" {
+                checked(workspace, "cc", [optimization, "-fPIC", "-c", "tests/host/got.c", "-o", host])
+            } else {
+                if mode == "no-plt" {
+                    checked(workspace, "cc", [optimization, "-fPIC", "-fno-plt", "-c", "tests/host/got.c", "-o", host])
+                } else {
+                    checked(workspace, "cc", [optimization, "-fPIC", "-fno-plt", "-Wa,-mrelax-relocations=no", "-c", "tests/host/got.c", "-o", host])
+                }
+            }
+            let relocations = checked(workspace, "readelf", ["-Wr", host])
+            require(contains(relocations, "GOTPCREL"), "host fixture lacks GOT relocations")
+            if mode == "no-plt" {
+                require(contains(relocations, "R_X86_64_GOTPCRELX"), "host fixture lacks non-REX GOTPCRELX")
+                require(contains(relocations, "R_X86_64_REX_GOTPCRELX"), "host fixture lacks REX GOTPCRELX")
+            }
+            if mode == "no-relax" {
+                require(contains(relocations, "R_X86_64_GOTPCREL"), "host fixture lacks unrelaxed GOTPCREL")
+                require(!contains(relocations, "GOTPCRELX"), "host assembler ignored no-relax flag")
+            }
+            checked(workspace, "cc", ["-no-pie", directory + "/reference-main.o", host, "-o", reference])
+            let expected = checked(workspace, reference, [])
+            checked(workspace, "env", [empty_path, nanoc, "--native-link", main, host, "-o", program])
+            equal(checked(workspace, program, []), expected, "GOT host/native output differs")
+            checked(workspace, "ar", ["rcs", directory + "/libgot.a", host])
+            checked(workspace, "env", [empty_path, nanoc, "--native-link", main, directory + "/libgot.a", "-o", program])
+            equal(checked(workspace, program, []), expected, "archive GOT host/native output differs")
+        }
+    }
+
+    # Local GOT definitions with the same spelling in different units stay private.
+    write(workspace + "/local-first.s", ".text\n.globl got_first\n.type got_first,@function\ngot_first:\nmovq value@GOTPCREL(%rip),%rax\nmovl (%rax),%eax\nret\n.size got_first,.-got_first\n.data\n.local value\n.type value,@object\nvalue:\n.long 17\n.size value,4\n.section .note.GNU-stack,\"\",@progbits\n")
+    write(workspace + "/local-second.s", ".text\n.globl got_second\n.type got_second,@function\ngot_second:\nmovq value@GOTPCREL(%rip),%rax\nmovl (%rax),%eax\nret\n.size got_second,.-got_second\n.data\n.local value\n.type value,@object\nvalue:\n.long 25\n.size value,4\n.section .note.GNU-stack,\"\",@progbits\n")
+    for unit in ["first", "second"] {
+        checked(workspace, "cc", ["-Wa,-mrelax-relocations=no", "-c", directory + "/local-" + unit + ".s", "-o", directory + "/local-" + unit + ".o"])
+    }
+    write(workspace + "/local-main.c", "int got_first(void); int got_second(void); int main(void) { return got_first() + got_second() - 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/local-main.c", directory + "/local-first.o", directory + "/local-second.o", "-o", program])
+    checked(workspace, program, [])
+
+    # Check arbitrary addends and GOT-base references without relaxing opcodes.
+    write(workspace + "/addend.s", """.text
+.globl got_addends
+.type got_addends, @function
+got_addends:
+    leaq got_value@GOTPCREL-8(%rip), %rcx
+    leaq got_value@GOTPCREL(%rip), %rax
+    subq $8, %rax
+    cmpq %rcx, %rax
+    jne .Lbad
+    leaq got_value@GOTPCREL+8(%rip), %rdx
+    addq $16, %rax
+    cmpq %rax, %rdx
+    jne .Lbad
+    leaq _GLOBAL_OFFSET_TABLE_(%rip), %rax
+    testq %rax, %rax
+    sete %al
+    movzbl %al, %eax
+    ret
+.Lbad:
+    movl $1, %eax
+    ret
+.size got_addends, .-got_addends
+.section .note.GNU-stack,"",@progbits
+""")
+    checked(workspace, "cc", ["-Wa,-mrelax-relocations=no", "-c", directory + "/addend.s", "-o", directory + "/addend.o"])
+    write(workspace + "/addend-main.c", "int got_value = 42; int got_addends(void); int main(void) { return got_addends(); }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/addend-main.c", directory + "/addend.o", "-o", program])
+    checked(workspace, program, [])
+    let metadata = checked(workspace, "readelf", ["-hlWd", program])
+    require(contains(metadata, "EXEC (Executable file)"), "GOT linking unexpectedly became PIE")
+    require(!contains(metadata, "TEXTREL") && !contains(metadata, "RWE"), "GOT linking weakened segment protections")
+
+    # Broader scalar/aggregate ABI objects compiled as PIC and no-PLT.
+    checked(workspace, "cc", ["-c", "tests/host/alignment.s", "-o", directory + "/alignment.o"])
+    for optimization in ["-O0", "-O2"] {
+        for suite in ["call_abi", "variadic_abi", "aggregate_abi", "tcc_aggregate_compat"] {
+            checked(workspace, "cc", [optimization, "-fPIC", "-fno-plt", "-Wall", "-Wextra", "-Werror", "-c", "tests/host/" + suite + ".c", "-o", host])
+            if suite == "call_abi" {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", "tests/c/" + suite + ".c", host, directory + "/alignment.o", "-o", program])
+            } else {
+                checked(workspace, "env", [empty_path, nanoc, "--native-link", "tests/c/" + suite + ".c", host, "-o", program])
+            }
+            checked(workspace, program, [])
+        }
+    }
+    write(workspace + "/missing.c", "extern int missing_got_value; int missing(void) { return missing_got_value; }\n")
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/missing.c", "-o", host])
+    write(workspace + "/missing-main.c", "int missing(void); int main(void) { return missing(); }\n")
+    let missing = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/missing-main.c", host, "-o", rejected], 1)
+    require(contains(missing, "unresolved native symbol missing_got_value"), "unresolved GOT symbol became zero")
+    write(workspace + "/data.c", "extern int optind; int data(void) { return optind; }\n")
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/data.c", "-o", host])
+    write(workspace + "/data-main.c", "int data(void); int main(void) { return data(); }\n")
+    let data = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/data-main.c", host, "-o", rejected], 1)
+    require(contains(data, "native data/TLS imports are unsupported"), "GOT-only data import was misclassified as a function")
+    write(workspace + "/overflow.s", ".text\n.globl got_overflow\n.type got_overflow,@function\ngot_overflow:\nmovq got_value@GOTPCREL+4294967295(%rip), %rax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/overflow.s", "-o", host])
+    let overflow = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/addend-main.c", host, directory + "/addend.o", "-o", rejected], 1)
+    require(contains(overflow, "native signed relocation overflow"), "GOT relocation silently truncated")
+    # Reject truncated GOT patches and unsupported large-model GOT arithmetic.
+    write(workspace + "/bounds.s", ".text\n.globl got_bounds\n.type got_bounds,@function\ngot_bounds:\nret\n.reloc 0,R_X86_64_GOTPCREL,got_value\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/bounds.s", "-o", host])
+    let bounds = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/addend-main.c", host, directory + "/addend.o", "-o", rejected], 1)
+    require(contains(bounds, "ELF relocation offset out of bounds"), "GOT patch crossed its section boundary")
+    write(workspace + "/large.s", ".text\n.globl got_large\n.type got_large,@function\ngot_large:\nmovabsq $got_value@GOTOFF,%rax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/large.s", "-o", host])
+    let large = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/addend-main.c", host, directory + "/addend.o", "-o", rejected], 1)
+    require(contains(large, "unsupported native relocation type 25"), "large-model GOT relocation silently fell back")
+    require(!exists(workspace + "/rejected"), "failed GOT links wrote an output")
+    finish_workspace(workspace)
+    print("native GOTPCREL/GOTPCRELX: PIC/no-PLT objects, canonical pointers, archive/ABI, no fallback: ok")
+}

@@ -90,15 +90,22 @@ in an unused member do not prevent linking; selected members are validated
 fully. Native input files, including archives, are limited to 16 MiB.
 
 Supported object relocations are `R_X86_64_NONE`, `R_X86_64_64`,
-`R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_32`, and `R_X86_64_32S`, with
-bounds and 32-bit overflow checks. Unsupported relocations fail explicitly;
-the native linker **never falls back** to the host toolchain.
+`R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_32`, `R_X86_64_32S`,
+`R_X86_64_GOTPCREL`, `R_X86_64_GOTPCRELX`, `R_X86_64_REX_GOTPCRELX`,
+and `R_X86_64_GOTPC32`, with bounds and 32-bit overflow checks. Unsupported
+relocations fail explicitly; the native linker **never falls back** to the host
+toolchain.
 
-PIE, GOT/TLS object relocations, data imports (including `stdout`
+PIC and `-fno-plt` host objects using these GOT relocations are supported,
+including archive members. The linker allocates real GOT slots without
+instruction relaxation; local definitions are resolved at link time, while
+imported function pointers consistently use the generated callable stub.
+
+PIE, TLS and large-model GOT relocations, data imports (including `stdout`
 and `optind`), weak/common/absolute symbols, non-default visibility, linker
 scripts, `-Wl` flags, and constructor/destructor sections are not supported.
-Host objects with GOT relocations may need `-fno-pic -fno-pie`; this does not
-guarantee that every host object is supported. Native linking stays opt-in
+Accepting PIC objects does not make the output PIE, nor does it guarantee
+that every host object is supported. Native linking stays opt-in
 while this limited surface is verified.
 
 ## Tests
@@ -123,7 +130,7 @@ and retain failed-test artifacts for inspection.
 
 Individual suites can be run with `arq test_preprocessor`, `arq test_driver`,
 `arq test_abi`, `arq test_smoke`, `arq test_language`, `arq test_rejections`,
-`arq test_native`, and `arq test_archive`.
+`arq test_native`, `arq test_archive`, and `arq test_got`.
 Each depends on `build`; a full invocation builds once before the isolated test
 tasks run. The native suite hides the host toolchain with an empty `PATH`,
 checks ELF metadata, compares native and host-linked output, and exercises
@@ -131,6 +138,9 @@ multiple units, shared-library imports, `-run`, scalar/aggregate ABI at `-O0`
 and `-O2`, and explicit failures for unsupported relocations and inputs.
 The archive suite also hides `ar` from nanoc and checks lazy member selection,
 dependency closure, input ordering, long names, padding, and malformed inputs.
+The GOT suite checks PIC/no-PLT and non-relaxable relocations at `-O0`/`-O2`,
+archive members, private locals, function-pointer identity, arbitrary addends,
+and overflow/bounds rejection, again with the toolchain hidden from nanoc.
 
 Optionally compare the language and aggregate ABI tests with an installed TinyCC:
 
@@ -209,7 +219,7 @@ unsupported inputs and no implicit host-toolchain fallback. Remaining work
 includes:
 
 - Thin archives, archive groups, and archive creation
-- GOT relocations and broader host-object compatibility
+- Large-model GOT/TLS relocations and broader host-object compatibility
 - Weak/common/absolute symbols and data imports
 - Constructor/destructor handling and additional ELF validation
 - PIE support and more portable shared-library lookup/deployment

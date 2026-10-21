@@ -4,6 +4,7 @@ import "tests/arq/compiler.arq"
 import "tests/arq/language.arq"
 import "tests/arq/native.arq"
 import "tests/arq/archive.arq"
+import "tests/arq/got.arq"
 
 task build {
     run "ntsc build"
@@ -21,7 +22,7 @@ task test_smoke after build {
     print("standard I/O, headers, variadic functions, integer widths: ok")
 }
 
-task test after test_preprocessor, test_driver, test_abi, test_smoke, test_language, test_rejections, test_native, test_archive {}
+task test after test_preprocessor, test_driver, test_abi, test_smoke, test_language, test_rejections, test_native, test_archive, test_got {}
 
 task check {
     test

@@ -59,8 +59,8 @@ task test_archive after build {
     checked(workspace, program, [])
 
     # Unsupported relocations matter only in members that get selected.
-    write(workspace + "/pic.c", "extern int outside_value; int archive_pic(void) { return outside_value; }\n")
-    checked(workspace, "cc", ["-fPIC", "-c", directory + "/pic.c", "-o", directory + "/pic.o"])
+    write(workspace + "/pic.s", ".text\n.globl archive_pic\n.type archive_pic,@function\narchive_pic:\nmovabsq $outside_value@GOTOFF,%rax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/pic.s", "-o", directory + "/pic.o"])
     checked(workspace, "ar", ["rcs", directory + "/libpic.a", directory + "/pic.o", leaf, entry])
     checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libpic.a", "-o", program])
     checked(workspace, program, [])

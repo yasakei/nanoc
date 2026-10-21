@@ -28,10 +28,15 @@ fun nativeValidateElf(view array[int] bytes, int kind) {
     if(count == 0) { throw "nanoc: extended or missing ELF section table is unsupported" }
     nativeRange(bytes,binaryUnsigned(bytes,40,8),count * 64)
 }
+// GOTPCRELX variants permit relaxation, but an ordinary GOT load is valid.
+// Keep instructions unchanged and use real slots rather than rewrite opcodes.
+fun nativeGotRelocation(int kind) -> bool {
+    return kind == 9 || kind == 41 || kind == 42
+}
 fun nativeRelocationWidth(int kind) -> int {
     if(kind == 0) { return 0 }
     if(kind == 1) { return 8 }
-    if(kind == 2 || kind == 4 || kind == 10 || kind == 11) { return 4 }
+    if(kind == 2 || kind == 4 || kind == 10 || kind == 11 || kind == 26 || nativeGotRelocation(kind)) { return 4 }
     throw "nanoc: unsupported native relocation type " + ("" + kind)
 }
 fun nativeMerge(view mut NativeObject target, view NativeObject source, int objectId) {
@@ -310,8 +315,8 @@ fun nativeApplyRelocation(view mut array[int] bytes, int offset, int kind, int s
     var width = nativeRelocationWidth(kind)
     if(kind == 0) { return; }
     var value = symbol + addend
-    if(kind == 2 || kind == 4) { value = value - place }
-    if((kind == 2 || kind == 4 || kind == 11) && (value < -2147483648 || value > 2147483647)) { throw "nanoc: native signed relocation overflow" }
+    if(kind == 2 || kind == 4 || kind == 26 || nativeGotRelocation(kind)) { value = value - place }
+    if((kind == 2 || kind == 4 || kind == 11 || kind == 26 || nativeGotRelocation(kind)) && (value < -2147483648 || value > 2147483647)) { throw "nanoc: native signed relocation overflow" }
     if(kind == 10 && (value < 0 || value > 4294967295)) { throw "nanoc: native unsigned relocation overflow" }
     binaryPatch(bytes,offset,value,width)
 }
@@ -329,6 +334,7 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
     while(index < arrays.length(O.symbols)) {
         view var symbol = O.symbols[index]
         if(symbol.section == 0) {
+            if(symbol.name == "_GLOBAL_OFFSET_TABLE_") { index = index + 1; continue; }
             if(symbol.kind == 1 || symbol.kind == 6) { throw "nanoc: native data/TLS imports are unsupported: " + copy(symbol.name) }
             if(arrays.index_of(functions,symbol.name) < 0) {
                 if(arrays.index_of(objects,symbol.name) >= 0) { throw "nanoc: native data/TLS imports are unsupported: " + copy(symbol.name) }
@@ -378,6 +384,27 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         binaryAppend(got.bytes,0,8)
         // Fill RELA addresses once segment offsets are final.
         binaryAppend(rela.bytes,0,8); binaryAppend(rela.bytes,((index + 1) << 32) | 6,8); binaryAppend(rela.bytes,0,8)
+        index = index + 1
+    }
+    // Separate address slots from the dynamic resolver slots used by stubs.
+    // Imported function addresses must use the same canonical stub as ordinary
+    // R_X86_64_64/PC32 references; putting a stub into its own resolver slot
+    // would recurse forever. Locally defined symbols need no runtime relocations.
+    var array[int] gotSlots = []
+    index = 0
+    while(index < arrays.length(O.symbols)) { arrays.push(gotSlots,-1); index = index + 1 }
+    index = 0
+    while(index < arrays.length(O.relocations)) {
+        view var relocation = O.relocations[index]
+        if(nativeGotRelocation(relocation.kind)) {
+            var si = 0
+            while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
+            if(si == arrays.length(O.symbols)) { throw "nanoc: missing native GOT symbol " + copy(relocation.symbol) }
+            if(arrays.at(gotSlots,si) < 0) {
+                gotSlots[si] = arrays.length(got.bytes)
+                binaryAppend(got.bytes,0,8)
+            }
+        }
         index = index + 1
     }
     binaryAppend(hash.bytes,1,4); binaryAppend(hash.bytes,arrays.length(imports) + 1,4)
@@ -437,14 +464,36 @@ fun nativeWriteExecutable(view mut NativeObject O, view string path, view array[
         index = index + 1
     }
     index = 0
+    while(index < arrays.length(gotSlots)) {
+        var slot = arrays.at(gotSlots,index)
+        if(slot >= 0) {
+            view var symbol = O.symbols[index]
+            var address = baseAddress + arrays.at(offsets,8)
+            if(symbol.name != "_GLOBAL_OFFSET_TABLE_" || symbol.section != 0) {
+                if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native GOT symbol " + copy(symbol.name) }
+                address = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
+            }
+            binaryPatch(bytes,arrays.at(offsets,8) + slot,address,8)
+        }
+        index = index + 1
+    }
+    index = 0
     while(index < arrays.length(O.relocations)) {
         view var relocation = O.relocations[index]
         var si = 0
         while(si < arrays.length(O.symbols) && O.symbols[si].name != relocation.symbol) { si = si + 1 }
         if(si == arrays.length(O.symbols)) { throw "nanoc: missing native relocation symbol " + copy(relocation.symbol) }
         view var symbol = O.symbols[si]
-        if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native relocation" }
-        var symbolAddress = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
+        var symbolAddress = baseAddress + arrays.at(offsets,8)
+        if(symbol.name != "_GLOBAL_OFFSET_TABLE_" || symbol.section != 0) {
+            if(symbol.section <= 0 || symbol.section > 3) { throw "nanoc: unresolved native relocation" }
+            symbolAddress = arrays.at(sectionAddresses,symbol.section - 1) + symbol.value
+        }
+        if(relocation.kind == 26) { symbolAddress = baseAddress + arrays.at(offsets,8) }
+        if(nativeGotRelocation(relocation.kind)) {
+            if(arrays.at(gotSlots,si) < 0) { throw "nanoc: missing native GOT slot" }
+            symbolAddress = baseAddress + arrays.at(offsets,8) + arrays.at(gotSlots,si)
+        }
         var sectionOffset = arrays.at(offsets,1)
         if(relocation.section == 2) { sectionOffset = arrays.at(offsets,7) }
         if(relocation.section == 3) { sectionOffset = arrays.at(offsets,2) }
