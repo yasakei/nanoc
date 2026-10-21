@@ -8,3 +8,6 @@ a.out
 *.out
 *.bin
 .DS_Store
+
+# Local-only README asset generator
+/docs/assets/render_header.py
