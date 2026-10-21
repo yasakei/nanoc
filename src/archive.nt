@@ -161,7 +161,7 @@ fun nativeArchiveNeeded(view NativeObject O, view NativeArchiveMember member) ->
     var index = 0
     while(index < arrays.length(O.symbols)) {
         view var symbol = O.symbols[index]
-        if(symbol.section == 0 && arrays.index_of(member.exports,symbol.name) >= 0) { return true }
+        if(symbol.section == 0 && symbol.weak == false && arrays.index_of(member.exports,symbol.name) >= 0) { return true }
         if(nativeCommonSymbol(symbol) && arrays.index_of(member.strongExports,symbol.name) >= 0) { return true }
         index = index + 1
     }

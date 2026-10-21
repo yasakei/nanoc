@@ -71,7 +71,7 @@ GOT-backed function stubs, and eager dynamic relocations. The executable has
 separate RX/RW load segments and a non-executable stack.
 
 libc is loaded automatically. `-lm`, `-L dir -lname`, and explicit ELF `.so`
-inputs are supported for function imports; shared-library paths are recorded
+inputs support function and ordinary data imports; shared-library paths are recorded
 as absolute `DT_NEEDED` entries, so moving/removing those libraries requires
 relinking. This is not yet a portable deployment format.
 
@@ -109,12 +109,44 @@ strong definition regardless of object order. Strong definitions in archives
 can also replace common declarations. The current implementation materializes
 common storage in `.data` and limits it to 16 MiB with alignment up to 4096.
 
-PIE, TLS and large-model GOT relocations, data imports (including `stdout`
-and `optind`), weak symbols, non-default visibility, linker
-scripts, `-Wl` flags, and constructor/destructor sections are not supported.
-Accepting PIC objects does not make the output PIE, nor does it guarantee
-that every host object is supported. Native linking stays opt-in
-while this limited surface is verified.
+Weak ELF definitions yield to common and strong definitions, with the first
+weak definition retained when no stronger one exists. An unresolved weak
+reference becomes zero and does not trigger archive extraction; a strong
+reference can still pull a weak provider out of an archive. C declarations
+can use `__attribute__((weak))` before the type or after the declarator.
+Weak declarations require external linkage.
+
+Ordinary shared-library data imports, including libc's `stdin`, `stdout`,
+`stderr`, and `optind`, use `R_X86_64_COPY` relocations. The executable reserves
+aligned storage and exports its symbols so both native references and
+preemptible shared-library references see the same data. Function-pointer
+and data-pointer initializers, PIC GOT references, arrays, and executable data
+overrides are tested. TLS, protected data, zero-sized data imports, and imports
+larger than 16 MiB are rejected. Copy storage is materialized in `.data`; this
+is a non-PIE implementation, not a general dynamic-linking replacement.
+
+Constructor/destructor functions can use
+`__attribute__((constructor))` / `__attribute__((destructor))`, optionally with
+an integer priority from 101 to 65535. nanoc requires these functions to return
+`void` and take no parameters. Attributes on an earlier prototype carry through
+to its definition. Native `.o` files retain numbered `.init_array`/`.fini_array`
+sections for host-linker interoperability. The native executable emits the
+corresponding dynamic tags, sorts priorities in increasing order for
+initialization, and lets glibc run finalizers in reverse order on normal return
+or `exit`. `_Exit` intentionally bypasses finalizers. Allocated host
+`.preinit_array` inputs are also supported. Archive members run their lifecycle
+functions only when selected.
+
+Legacy `.ctors`/`.dtors` lists and `.init`/`.fini` code fragments remain
+unsupported. Malformed arrays, null/sentinel entries, non-code pointers, and
+unsupported attributes fail explicitly. Only the three attributes above (and
+their double-underscore aliases) are supported; arbitrary GNU attributes are
+not silently ignored.
+
+PIE, TLS and large-model GOT relocations, non-default visibility in object
+inputs, linker scripts, and `-Wl` flags remain unsupported. Accepting PIC
+objects does not make the output PIE, nor does it guarantee that every host
+object is supported. Native linking stays opt-in while this surface is verified.
 
 ## Tests
 
@@ -138,7 +170,8 @@ and retain failed-test artifacts for inspection.
 
 Individual suites can be run with `arq test_preprocessor`, `arq test_driver`,
 `arq test_abi`, `arq test_smoke`, `arq test_language`, `arq test_rejections`,
-`arq test_native`, `arq test_archive`, `arq test_got`, and `arq test_symbols`.
+`arq test_native`, `arq test_archive`, `arq test_got`, `arq test_symbols`,
+`arq test_weak`, `arq test_data_imports`, and `arq test_lifecycle`.
 Each depends on `build`; a full invocation builds once before the isolated test
 tasks run. The native suite hides the host toolchain with an empty `PATH`,
 checks ELF metadata, compares native and host-linked output, and exercises
@@ -151,6 +184,11 @@ archive members, private locals, function-pointer identity, arbitrary addends,
 and overflow/bounds rejection, again with the toolchain hidden from nanoc.
 The symbol suite covers absolute values, common storage, strong overrides,
 archive resolution, alignment/size bounds, and duplicate definitions.
+The feature suites additionally check weak resolution, libc/shared data and
+copy relocations, executable exports, lifecycle priorities, host-object
+interoperability, preinit, normal/early exit, and shared-library initialization.
+These native paths run with an empty `PATH`, so `cc`, `as`, `ld`, and `ar`
+cannot be used as a fallback.
 
 Optionally compare the language and aggregate ABI tests with an installed TinyCC:
 
@@ -205,6 +243,8 @@ so mixed-record TinyCC objects are not advertised as interoperable.
   large records
 - Aggregate `va_arg`, named aggregate variadic parameters, variadic aggregate
   returns, and direct/indirect calls interoperating with host C
+- GNU-style `weak`, `constructor`, and `destructor` declaration attributes
+  with native object/linker support
 
 ## Limitations
 
@@ -230,8 +270,8 @@ includes:
 
 - Thin archives, archive groups, and archive creation
 - Large-model GOT/TLS relocations and broader host-object compatibility
-- Weak symbols and data imports
-- Constructor/destructor handling and additional ELF validation
+- Broader symbol visibility/versioning and dynamic-linker compatibility
+- Legacy lifecycle formats and additional ELF validation
 - PIE support and more portable shared-library lookup/deployment
 
 `--native-link` will remain opt-in while these paths are implemented and

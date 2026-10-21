@@ -29,6 +29,9 @@ fun compilerAdd(view mut Compiler C, view Symbol S) {
         prior.function = S.function
         prior.typedef = S.typedef
         prior.params = copy(S.params)
+        prior.weak = prior.weak || S.weak
+        if(S.constructor >= 0) { prior.constructor = S.constructor }
+        if(S.destructor >= 0) { prior.destructor = S.destructor }
     } else {
         arrays.push(C.globals, copy(S))
     }
@@ -260,6 +263,9 @@ fun parseBaseType(view mut Cursor C) -> string {
 }
 
 class Decl {
+    var bool weak
+    var int constructor
+    var int destructor
     var bool internal
     var string name
     var string ctype
@@ -270,6 +276,9 @@ class Decl {
 
     fun init(string name, string ctype) {
         this.internal = false
+        this.weak = false
+        this.constructor = -1
+        this.destructor = -1
         this.name = name
         this.ctype = ctype
         this.function = false
@@ -279,6 +288,37 @@ class Decl {
     }
 }
 
+// Deliberately narrow GNU attribute surface; reject unknown attributes.
+fun parseNativeAttributes(view mut Cursor P, view mut Decl D) {
+    while(P.isWord("__attribute__") || P.isWord("__attribute")) {
+        P.take(); expectPunct(P,"("); expectPunct(P,"(")
+        while(P.isPunct(")") == false) {
+            var attribute = P.take().text
+            if(attribute == "__weak__") { attribute = "weak" }
+            if(attribute == "__constructor__") { attribute = "constructor" }
+            if(attribute == "__destructor__") { attribute = "destructor" }
+            if(attribute == "weak") { D.weak = true } else if(attribute == "constructor" || attribute == "destructor") {
+                var priority = 65535
+                if(P.isPunct("(")) {
+                    P.take()
+                    var value = P.take()
+                    if(value.kind != "num" || value.ival < 101 || value.ival > 65535) { parseFail(P,"lifecycle priority must be an integer from 101 to 65535") }
+                    priority = value.ival
+                    expectPunct(P,")")
+                }
+                if(attribute == "constructor") { D.constructor = priority } else { D.destructor = priority }
+            } else { parseFail(P,"unsupported attribute " + attribute) }
+            if(P.isPunct(",") == false) { break }
+            P.take()
+        }
+        expectPunct(P,")"); expectPunct(P,")")
+    }
+}
+fun applyNativeAttributes(view mut Decl D, view Decl attributes) {
+    D.weak = D.weak || attributes.weak
+    if(attributes.constructor >= 0) { D.constructor = attributes.constructor }
+    if(attributes.destructor >= 0) { D.destructor = attributes.destructor }
+}
 fun parseArraySuffix(view mut Cursor C, string ty) -> string {
     var array[int] dimensions = []
     while (C.isPunct("[")) {
@@ -639,8 +679,9 @@ fun parseExternal(view mut Compiler C, view mut Cursor P) -> int {
         P.take()
         typedef = true
     }
-    while (P.isWord("static") || P.isWord("extern")) {
-        P.take()
+    var attributes = Decl("","")
+    while(P.isWord("static") || P.isWord("extern") || P.isWord("__attribute__") || P.isWord("__attribute")) {
+        if(P.isWord("static") || P.isWord("extern")) { P.take() } else { parseNativeAttributes(P,attributes) }
     }
     if (isCompilerType(P, C) == false) {
         parseFail(P, "expected declaration")
@@ -648,10 +689,13 @@ fun parseExternal(view mut Compiler C, view mut Cursor P) -> int {
     var base = parseCompilerBaseType(P, C)
     while (true) {
         var D = parseDeclarator(P, copy(base))
+        parseNativeAttributes(P,D)
+        applyNativeAttributes(D,attributes)
         var S = Symbol(D.name, D.ctype, P.peek().line)
         S.function = D.function
         S.typedef = typedef
         S.params = copy(D.params)
+        S.weak = D.weak; S.constructor = D.constructor; S.destructor = D.destructor
         compilerAdd(C, S)
         if (typedef) {
             arrays.push(C.typedefNames, copy(D.name))

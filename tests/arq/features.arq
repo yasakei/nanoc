@@ -1,0 +1,241 @@
+# All nanoc compile/link invocations use an empty PATH. Host tools only build
+# fixtures or independent references; no native feature may silently fall back.
+task test_weak after build {
+    let workspace = test_workspace("weak")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/optional.c", "extern int optional_value __attribute__((weak)); __attribute__((weak)) int optional_function(void); int main(void) { return &optional_value != 0 || optional_function != 0; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/optional.c", "-o", directory + "/optional.o"])
+    let table = checked(workspace, "readelf", ["-Ws", directory + "/optional.o"])
+    require(contains(table, "WEAK") && contains(table, "optional_function"), "native object lost weak binding")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/optional.o", "-o", program])
+    checked(workspace, program, [])
+    # Host PIC weak references test zero GOT slots as well as absolute addresses.
+    checked(workspace, "cc", ["-fPIC", "-c", directory + "/optional.c", "-o", directory + "/optional-pic.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/optional-pic.o", "-o", program])
+    checked(workspace, program, [])
+    write(workspace + "/provider.c", "int optional_value = 42; int optional_function(void) { return 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/provider.c", "-o", directory + "/provider.o"])
+    checked(workspace, "ar", ["rcs", directory + "/libprovider.a", directory + "/provider.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/optional.o", directory + "/libprovider.a", "-o", program])
+    checked(workspace, program, [])
+    # A strong reference to either provider export pulls in the entire member.
+    write(workspace + "/required.c", "extern int optional_value; int optional_function(void) __attribute__((weak)); int main(void) { return optional_value != 42 || optional_function == 0 || optional_function() != 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/required.c", directory + "/libprovider.a", "-o", program])
+    checked(workspace, program, [])
+    write(workspace + "/weak-ref.c", "extern int optional_value __attribute__((weak)); int *weak_address(void) { return &optional_value; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/weak-ref.c", "-o", directory + "/weak-ref.o"])
+    let missing = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/weak-ref.o", directory + "/required.c", "-o", rejected], 1)
+    require(contains(missing, "unresolved native symbol optional_value"), "strong reference was weakened by an optional declaration")
+
+    write(workspace + "/weak.c", "__attribute__((weak)) int selected(void) { return 17; } int weak_value __attribute__((weak)) = 17;\n")
+    write(workspace + "/other-weak.c", "int selected(void) __attribute__((weak)); int selected(void) { return 25; } __attribute__((weak)) int weak_value = 25;\n")
+    write(workspace + "/strong.c", "int selected(void) { return 42; } int weak_value = 42;\n")
+    write(workspace + "/main.c", "int selected(void); extern int weak_value; int main(void) { return selected() != EXPECTED || weak_value != EXPECTED; }\n")
+    for unit in ["weak", "other-weak", "strong"] {
+        checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/" + unit + ".c", "-o", directory + "/" + unit + ".o"])
+    }
+    for first in ["weak", "strong"] {
+        var second = "weak"
+        if first == "weak" { second = "strong" }
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", "-DEXPECTED=42", directory + "/main.c", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", program])
+        checked(workspace, program, [])
+    }
+    for first in ["weak", "other-weak"] {
+        var second = "weak"
+        var expected = "25"
+        if first == "weak" { second = "other-weak"; expected = "17" }
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", "-DEXPECTED=" + expected, directory + "/main.c", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", program])
+        checked(workspace, program, [])
+    }
+    # Common definitions outrank weak definitions; verify -fcommon plus weak data.
+    write(workspace + "/common.c", "int weak_value;\n")
+    checked(workspace, "cc", ["-fcommon", "-c", directory + "/common.c", "-o", directory + "/common.o"])
+    write(workspace + "/common-main.c", "extern int weak_value; int main(void) { return weak_value; }\n")
+    for first in ["weak", "common"] {
+        var second = "weak"
+        if first == "weak" { second = "common" }
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/common-main.c", directory + "/" + first + ".o", directory + "/" + second + ".o", "-o", program])
+        checked(workspace, program, [])
+    }
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/provider.c", "-o", directory + "/libprovider.so"])
+    write(workspace + "/shared-main.c", "int optional_function(void) __attribute__((weak)); int main(void) { return optional_function == 0 || optional_function() != 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/shared-main.c", directory + "/libprovider.so", "-o", program])
+    checked(workspace, program, [])
+    # A strong unresolved reference may select a weak definition from an archive.
+    checked(workspace, "ar", ["rcs", directory + "/libweak.a", directory + "/weak.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", "-DEXPECTED=17", directory + "/main.c", directory + "/libweak.a", "-o", program])
+    checked(workspace, program, [])
+    let duplicate = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", "-DEXPECTED=42", directory + "/main.c", directory + "/strong.o", directory + "/strong.o", "-o", rejected], 1)
+    require(contains(duplicate, "duplicate native symbol selected"), "weak support disabled strong duplicate rejection")
+    write(workspace + "/bad.c", "static int hidden(void) __attribute__((weak)); int main(void) { return 0; }\n")
+    let bad = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(bad, "weak declaration requires external linkage"), "static weak attribute was accepted")
+    require(!exists(workspace + "/rejected"), "failed weak links wrote output")
+    finish_workspace(workspace)
+    print("native weak symbols: precedence, optional zero, archive selection, C attributes: ok")
+}
+
+task test_data_imports after build {
+    let workspace = test_workspace("data-imports")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let reference = directory + "/reference"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/stdio.c", "#include <stdio.h>\nextern int optind; int main(void) { if (optind != 1 || stdout == 0 || stderr == 0 || stdin == 0) return 1; fprintf(stdout,\"native stdout works\\n\"); fflush(stdout); return 0; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/stdio.c", "-o", program])
+    equal(checked(workspace, program, []), "native stdout works\n", "libc data imports failed")
+    let relocations = checked(workspace, "readelf", ["-Wr", program])
+    require(contains(relocations, "R_X86_64_COPY") && contains(relocations, "stdout"), "data imports lack copy relocations")
+    write(workspace + "/provider.c", """int shared_value = 42;
+unsigned char shared_bytes[128] __attribute__((aligned(64))) = { 17 };
+int *shared_address(void) { return &shared_value; }
+unsigned char *shared_array_address(void) { return shared_bytes; }
+int shared_increment(void) { return ++shared_value; }
+void shared_set_last(void) { shared_bytes[127] = 25; }
+int shared_read(void) { return shared_value; }
+""")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/provider.c", "-o", directory + "/libdata.so"])
+    write(workspace + "/main.c", """extern int shared_value;
+extern unsigned char shared_bytes[128];
+int *shared_address(void); unsigned char *shared_array_address(void);
+int shared_increment(void); void shared_set_last(void);
+int *initial_address = &shared_value;
+int main(void) {
+    if (shared_value != 42 || shared_bytes[0] != 17 || shared_bytes[127] != 0) return 1;
+    if ((unsigned long)shared_bytes % 64 != 0) return 2;
+    if (initial_address != shared_address() || shared_array_address() != shared_bytes) return 3;
+    if (shared_increment() != 43 || shared_value != 43) return 4;
+    shared_value = 44; if (*shared_address() != 44) return 5;
+    shared_set_last(); return shared_bytes[127] != 25;
+}
+""")
+    checked(workspace, "cc", [directory + "/main.c", directory + "/libdata.so", "-o", reference])
+    checked(workspace, reference, [])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/libdata.so", "-o", program])
+    checked(workspace, program, [])
+    for optimization in ["-O0", "-O2"] {
+        checked(workspace, "cc", [optimization, "-fPIC", "-c", directory + "/main.c", "-o", directory + "/pic-main.o"])
+        checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/pic-main.o", directory + "/libdata.so", "-o", program])
+        checked(workspace, program, [])
+    }
+    # Executable definitions must also be visible to the DSO (no copy needed).
+    write(workspace + "/override.c", "int shared_value = 99; int shared_read(void); int main(void) { return shared_read() != 99; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/override.c", directory + "/libdata.so", "-o", program])
+    checked(workspace, program, [])
+    let override_relocs = checked(workspace, "readelf", ["-Wr", program])
+    require(!contains(override_relocs, "R_X86_64_COPY"), "executable-owned data got an unnecessary copy")
+    write(workspace + "/tls-provider.c", "__thread int unsupported_tls = 42;\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/tls-provider.c", "-o", directory + "/libtls.so"])
+    write(workspace + "/tls-symbol.s", ".text\n.globl tls_address\n.type tls_address,@function\ntls_address:\nleaq unsupported_tls(%rip),%rax\nret\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/tls-symbol.s", "-o", directory + "/tls-symbol.o"])
+    write(workspace + "/tls-main.c", "long tls_address(void); int main(void) { return tls_address() == 0; }\n")
+    let tls = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/tls-main.c", directory + "/tls-symbol.o", directory + "/libtls.so", "-o", rejected], 1)
+    require(contains(tls, "native TLS imports are unsupported"), "TLS data was copied as ordinary data")
+    write(workspace + "/wrong.c", "int shared_value(void); int main(void) { return shared_value(); }\n")
+    let wrong = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/wrong.c", directory + "/libdata.so", "-o", rejected], 1)
+    require(contains(wrong, "function import resolves to a data symbol"), "data symbol was accepted as a callable import")
+    write(workspace + "/protected.c", "__attribute__((visibility(\"protected\"))) int protected_value = 42;\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/protected.c", "-o", directory + "/libprotected.so"])
+    write(workspace + "/protected-main.c", "extern int protected_value; int main(void) { return protected_value - 42; }\n")
+    let protected = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/protected-main.c", directory + "/libprotected.so", "-o", rejected], 1)
+    require(contains(protected, "protected data imports cannot use copy relocations"), "protected data was silently copied")
+    write(workspace + "/zero.s", ".data\n.globl zero_data\n.type zero_data,@object\nzero_data:\n.size zero_data,0\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-shared", "-nostdlib", directory + "/zero.s", "-o", directory + "/libzero.so"])
+    write(workspace + "/zero-main.c", "extern int zero_data; int main(void) { return zero_data; }\n")
+    let zero = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/zero-main.c", directory + "/libzero.so", "-o", rejected], 1)
+    require(contains(zero, "unsupported native data import size"), "zero-sized data import was copied")
+    require(!exists(workspace + "/rejected"), "failed data imports wrote output")
+    finish_workspace(workspace)
+    print("native data imports: libc streams, copy relocations, PIC pointers, shared storage/export: ok")
+}
+
+task test_lifecycle after build {
+    let workspace = test_workspace("lifecycle")
+    let directory = absolute(workspace)
+    let nanoc = absolute("build/debug/nanoc")
+    let program = directory + "/program"
+    let reference = directory + "/reference"
+    let rejected = directory + "/rejected"
+    mkdir(workspace + "/empty-path")
+    let empty_path = "PATH=" + directory + "/empty-path"
+    write(workspace + "/early.c", "#include <stdio.h>\n__attribute__((constructor(150))) static void early(void) { puts(\"ctor-150\"); } __attribute__((destructor(150))) static void early_fini(void) { puts(\"dtor-150\"); } int archive_anchor(void) { return 0; }\n")
+    write(workspace + "/late.c", "#include <stdio.h>\nstatic void late(void) __attribute__((constructor(250))); static void late(void) { puts(\"ctor-250\"); } static void late_fini(void) __attribute__((destructor(250))); static void late_fini(void) { puts(\"dtor-250\"); }\n")
+    write(workspace + "/main.c", "#include <stdio.h>\nint archive_anchor(void); __attribute__((constructor)) static void last_init(void) { puts(\"ctor-default\"); } __attribute__((destructor)) static void first_fini(void) { puts(\"dtor-default\"); } int main(void) { puts(\"main\"); return archive_anchor(); }\n")
+    let expected = "ctor-150\nctor-250\nctor-default\nmain\ndtor-default\ndtor-250\ndtor-150\n"
+    for unit in ["early", "late", "main"] {
+        checked(workspace, "env", [empty_path, nanoc, "-c", directory + "/" + unit + ".c", "-o", directory + "/" + unit + ".o"])
+    }
+    let object_headers = checked(workspace, "readelf", ["-SWr", directory + "/early.o"])
+    require(contains(object_headers, "INIT_ARRAY") && contains(object_headers, "FINI_ARRAY"), "native lifecycle object lacks arrays")
+    checked(workspace, "cc", ["-no-pie", directory + "/main.o", directory + "/late.o", directory + "/early.o", "-o", reference])
+    equal(checked(workspace, reference, []), expected, "host lifecycle reference differs")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/late.o", directory + "/early.o", "-o", program])
+    equal(checked(workspace, program, []), expected, "native lifecycle priority/reverse order differs")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.c", directory + "/late.c", directory + "/early.c", "-o", program])
+    equal(checked(workspace, program, []), expected, "native lifecycle source linking differs")
+    checked(workspace, "ar", ["rcs", directory + "/libearly.a", directory + "/early.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/late.o", directory + "/libearly.a", "-o", program])
+    equal(checked(workspace, program, []), expected, "archive constructor/destructor was dropped")
+    # Host objects retain their numbered sections and receive argc/argv/envp.
+    write(workspace + "/host.c", "#include <stdio.h>\n__attribute__((constructor(120))) static void arguments(int argc, char **argv, char **envp) { if (argc == 2 && argv && envp) puts(\"ctor-args\"); }\n")
+    checked(workspace, "cc", ["-O2", "-fPIC", "-c", directory + "/host.c", "-o", directory + "/host.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/late.o", directory + "/early.o", directory + "/host.o", "-o", program])
+    equal(checked(workspace, program, ["argument"]), "ctor-args\n" + expected, "host constructor did not receive process arguments")
+    let dynamic = checked(workspace, "readelf", ["-d", program])
+    require(contains(dynamic, "INIT_ARRAY") && contains(dynamic, "FINI_ARRAY"), "native lifecycle dynamic tags missing")
+    # Preinit executes before the main executable's init arrays.
+    write(workspace + "/preinit.c", "#include <stdio.h>\nstatic void before(void) { puts(\"preinit\"); } void (*preinit)(void) __attribute__((section(\".preinit_array\"),used)) = before;\n")
+    checked(workspace, "cc", ["-c", directory + "/preinit.c", "-o", directory + "/preinit.o"])
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/preinit.o", directory + "/main.o", directory + "/late.o", directory + "/early.o", "-o", program])
+    equal(checked(workspace, program, []), "preinit\n" + expected, "preinit order differs")
+    # exit invokes finalizers; _Exit intentionally does not.
+    write(workspace + "/exit-main.c", "void exit(int); int archive_anchor(void); int main(void) { archive_anchor(); exit(23); return 1; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/exit-main.c", directory + "/early.o", "-o", program])
+    equal(expect_exit(workspace, program, [], 23), "ctor-150\ndtor-150\n", "exit did not invoke native finalizers")
+    write(workspace + "/immediate-exit.c", "void _Exit(int); int main(void) { _Exit(24); return 1; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/immediate-exit.c", directory + "/early.o", "-o", program])
+    let immediate = expect_exit(workspace, program, [], 24)
+    require(!contains(immediate, "dtor"), "_Exit incorrectly ran finalizers")
+    # DSO constructors run after copy relocations and before executable arrays.
+    write(workspace + "/shared.c", "#include <stdio.h>\nint shared_state = 1; __attribute__((constructor)) static void shared_init(void) { shared_state = 42; puts(\"shared-init\"); } __attribute__((destructor)) static void shared_fini(void) { puts(\"shared-fini\"); }\n")
+    checked(workspace, "cc", ["-shared", "-fPIC", directory + "/shared.c", "-o", directory + "/libinit.so"])
+    write(workspace + "/shared-main.c", "#include <stdio.h>\nextern int shared_state; __attribute__((constructor)) static void local_init(void) { puts(\"local-init\"); } __attribute__((destructor)) static void local_fini(void) { puts(\"local-fini\"); } int main(void) { puts(\"shared-main\"); return shared_state != 42; }\n")
+    checked(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/shared-main.c", directory + "/libinit.so", "-o", program])
+    equal(checked(workspace, program, []), "shared-init\nlocal-init\nshared-main\nlocal-fini\nshared-fini\n", "DSO lifecycle/copy ordering differs")
+    write(workspace + "/bad.c", "__attribute__((constructor(20))) static void bad(void) {} int main(void) { return 0; }\n")
+    let priority = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(priority, "lifecycle priority"), "reserved constructor priority was accepted")
+    write(workspace + "/bad.c", "__attribute__((constructor)) int bad(int value) { return value; } int main(void) { return 0; }\n")
+    let signature = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(signature, "void function with no parameters"), "constructor signature was accepted")
+    write(workspace + "/legacy.s", ".section .ctors,\"aw\",@progbits\n.quad 0\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/legacy.s", "-o", directory + "/legacy.o"])
+    let legacy = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/early.o", directory + "/legacy.o", "-o", rejected], 1)
+    require(contains(legacy, "constructor/destructor sections are unsupported"), "legacy ctor list silently discarded")
+    write(workspace + "/short.s", ".section .init_array,\"aw\",@init_array\n.byte 1\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/short.s", "-o", directory + "/short.o"])
+    let short = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/early.o", directory + "/short.o", "-o", rejected], 1)
+    require(contains(short, "invalid lifecycle array size/type"), "truncated lifecycle array was accepted")
+    write(workspace + "/null.s", ".section .init_array,\"aw\",@init_array\nnull_entry:\n.quad 0\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/null.s", "-o", directory + "/null.o"])
+    let null_array = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/early.o", directory + "/null.o", "-o", rejected], 1)
+    require(contains(null_array, "null/sentinel lifecycle pointer"), "null constructor was accepted")
+    write(workspace + "/data-pointer.s", ".data\nlocal_data:\n.quad 42\n.section .init_array,\"aw\",@init_array\n.quad local_data\n.section .note.GNU-stack,\"\",@progbits\n")
+    checked(workspace, "cc", ["-c", directory + "/data-pointer.s", "-o", directory + "/data-pointer.o"])
+    let data_pointer = expect_exit(workspace, "env", [empty_path, nanoc, "--native-link", directory + "/main.o", directory + "/early.o", directory + "/data-pointer.o", "-o", rejected], 1)
+    require(contains(data_pointer, "does not target executable code"), "non-code constructor pointer was accepted")
+    write(workspace + "/bad.c", "__attribute__((unsupported_attribute)) int value; int main(void) { return 0; }\n")
+    let attribute = expect_exit(workspace, "env", [empty_path, nanoc, "-c", directory + "/bad.c", "-o", rejected], 1)
+    require(contains(attribute, "unsupported attribute"), "unknown attribute was silently ignored")
+    require(!exists(workspace + "/rejected"), "failed lifecycle links wrote output")
+    finish_workspace(workspace)
+    print("native lifecycle: C attributes, priorities, archive/host/preinit, finalizers, explicit errors: ok")
+}

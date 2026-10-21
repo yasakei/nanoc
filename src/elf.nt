@@ -24,6 +24,8 @@ class NativeSymbol {
     var int value
     var int size
     var bool global
+    var bool weak
+    var int visibility
     var int kind
     fun init(string name) {
         this.name = name
@@ -31,6 +33,8 @@ class NativeSymbol {
         this.value = 0
         this.size = 0
         this.global = false
+        this.weak = false
+        this.visibility = 0
         this.kind = 0
     }
 }
@@ -48,16 +52,31 @@ class NativeRelocation {
         this.addend = addend
     }
 }
+class NativeLifecycle {
+    var int section
+    var int offset
+    var int priority
+    fun init(int section, int offset, int priority) {
+        this.section = section; this.offset = offset; this.priority = priority
+    }
+}
 class NativeObject {
     var array[NativeSection] sections
     var array[NativeSymbol] symbols
     var array[NativeRelocation] relocations
     var int current
+    var array[NativeLifecycle] lifecycle
+    var int lifecyclePriority
     fun init() {
-        this.sections = [NativeSection(".text", 6), NativeSection(".data", 3), NativeSection(".rodata", 2)]
+        this.sections = [NativeSection(".text", 6), NativeSection(".data", 3), NativeSection(".rodata", 2), NativeSection(".init_array", 3), NativeSection(".fini_array", 3), NativeSection(".preinit_array", 3)]
         this.symbols = []
         this.relocations = []
         this.current = 1
+        this.lifecycle = []
+        this.lifecyclePriority = 65535
+        this.sections[3].kind = 14; this.sections[3].alignment = 8
+        this.sections[4].kind = 15; this.sections[4].alignment = 8
+        this.sections[5].kind = 16; this.sections[5].alignment = 8
     }
 }
 class NativeOperand {
@@ -432,6 +451,29 @@ fun nativeInstruction(view mut NativeObject O, view string mnemonic, view array[
     throw "nanoc: unsupported native instruction " + copy(mnemonic)
 }
 
+fun nativeLifecycleSection(view string name) -> int {
+    if(name == ".init_array" || strings.starts_with(copy(name),".init_array.")) { return 4 }
+    if(name == ".fini_array" || strings.starts_with(copy(name),".fini_array.")) { return 5 }
+    if(name == ".preinit_array" || strings.starts_with(copy(name),".preinit_array.")) { return 6 }
+    return 0
+}
+fun nativeLifecyclePriority(view string name) -> int {
+    var section = nativeLifecycleSection(name)
+    var prefix = ".init_array"
+    if(section == 5) { prefix = ".fini_array" }
+    if(section == 6) { prefix = ".preinit_array" }
+    if(name == prefix) { return 65535 }
+    var digits = strings.substring(copy(name),strings.length(copy(prefix)) + 1,strings.length(copy(name)))
+    if(digits == "") { throw "nanoc: empty lifecycle section priority" }
+    var priority = 0
+    var index = 0
+    while(index < strings.length(copy(digits))) {
+        var digit = strings.char_code(copy(digits),index) - 48
+        if(digit < 0 || digit > 9 || priority > (65535 - digit) / 10) { throw "nanoc: invalid lifecycle section priority" }
+        priority = priority * 10 + digit; index = index + 1
+    }
+    return priority
+}
 fun nativeAssemble(view string assembly) -> NativeObject {
     var O = NativeObject()
     var lines = strings.split_array(copy(assembly),"\n")
@@ -456,14 +498,19 @@ fun nativeAssemble(view string assembly) -> NativeObject {
             if(mnemonic == ".text") { O.current = 1; continue; }
             if(mnemonic == ".data") { O.current = 2; continue; }
             if(mnemonic == ".section") {
+                var sectionParts = nativeParts(arguments)
+                var name = copy(arrays.at(sectionParts,0))
+                var lifecycle = nativeLifecycleSection(name)
+                if(lifecycle != 0) { O.current = lifecycle; O.lifecyclePriority = nativeLifecyclePriority(name); continue; }
                 if(arguments == ".rodata") { O.current = 3; continue; }
                 if(strings.starts_with(copy(arguments),".note.GNU-stack")) { continue }
                 throw "unsupported native section " + arguments
             }
             var parts = nativeParts(arguments)
-            if(mnemonic == ".globl" || mnemonic == ".local") {
+            if(mnemonic == ".globl" || mnemonic == ".local" || mnemonic == ".weak") {
                 view mut var symbol = O.symbols[nativeSymbol(O,arguments)]
-                symbol.global = mnemonic == ".globl"
+                symbol.global = mnemonic != ".local"
+                symbol.weak = mnemonic == ".weak"
                 continue
             }
             if(mnemonic == ".type") {
@@ -510,6 +557,10 @@ fun nativeAssemble(view string assembly) -> NativeObject {
                 if(mnemonic == ".quad") { width = 8 }
                 var index = 0
                 while(index < arrays.length(parts)) {
+                    if(O.current >= 4) {
+                        if(width != 8 || nativeOffset(O) % 8 != 0) { throw "nanoc: lifecycle arrays require aligned 64-bit pointers" }
+                        arrays.push(O.lifecycle,NativeLifecycle(O.current,nativeOffset(O),O.lifecyclePriority))
+                    }
                     var expression = nativeExpression(arrays.at(parts,index))
                     if(expression.symbol == "") { nativeWord(O,expression.displacement,width) } else if(width == 8) { nativeRelocate(O,expression.symbol,1,expression.displacement,8) } else if(width == 4) { nativeRelocate(O,expression.symbol,10,expression.displacement,4) } else { throw "unsupported native data relocation width" }
                     index = index + 1
@@ -520,6 +571,21 @@ fun nativeAssemble(view string assembly) -> NativeObject {
             nativeInstruction(O,mnemonic,parts)
         } catch(err) { throw "nanoc: native assembler line " + ("" + lineIndex) + " (" + line + "): " + err }
     }
+    // .type/.weak declarations do not by themselves require an import.
+    var array[NativeSymbol] referencedSymbols = []
+    var symbolIndex = 0
+    while(symbolIndex < arrays.length(O.symbols)) {
+        view var symbol = O.symbols[symbolIndex]
+        var referenced = symbol.section != 0
+        var relocationIndex = 0
+        while(referenced == false && relocationIndex < arrays.length(O.relocations)) {
+            if(O.relocations[relocationIndex].symbol == symbol.name) { referenced = true }
+            relocationIndex = relocationIndex + 1
+        }
+        if(referenced) { arrays.push(referencedSymbols,copy(symbol)) }
+        symbolIndex = symbolIndex + 1
+    }
+    O.symbols = referencedSymbols
     return O
 }
 
@@ -551,7 +617,64 @@ fun nativeSymbolEntry(view mut array[int] bytes, int name, int binding, int kind
     binaryAppend(bytes,name,4); binaryAppend(bytes,(binding << 4) | kind,1); binaryAppend(bytes,0,1)
     binaryAppend(bytes,section,2); binaryAppend(bytes,value,8); binaryAppend(bytes,size,8)
 }
+// Preserve lifecycle priorities in ET_REL section names for independent host
+// linkers; internal merged arrays alone would lose priority information.
+fun nativeObjectForWrite(view NativeObject source) -> NativeObject {
+    var W = NativeObject()
+    W.sections = []
+    var index = 0
+    while(index < 3) { arrays.push(W.sections,copy(source.sections[index])); index = index + 1 }
+    var array[int] targetSections = []
+    var array[int] targetOffsets = []
+    index = 0
+    while(index < arrays.length(source.lifecycle)) {
+        view var entry = source.lifecycle[index]
+        var name = source.sections[entry.section - 1].name + "." + ("" + entry.priority)
+        var sectionIndex = 3
+        while(sectionIndex < arrays.length(W.sections) && W.sections[sectionIndex].name != name) { sectionIndex = sectionIndex + 1 }
+        if(sectionIndex == arrays.length(W.sections)) {
+            var section = NativeSection(name,3)
+            section.kind = source.sections[entry.section - 1].kind; section.alignment = 8
+            arrays.push(W.sections,section)
+        }
+        view mut var destination = W.sections[sectionIndex]
+        arrays.push(targetSections,sectionIndex + 1); arrays.push(targetOffsets,arrays.length(destination.bytes))
+        var bi = 0
+        while(bi < 8) { arrays.push(destination.bytes,source.sections[entry.section - 1].bytes[entry.offset + bi]); bi = bi + 1 }
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(source.symbols)) {
+        var symbol = copy(source.symbols[index])
+        if(symbol.section >= 4) {
+            var li = 0
+            while(li < arrays.length(source.lifecycle) && (source.lifecycle[li].section != symbol.section || source.lifecycle[li].offset != symbol.value)) { li = li + 1 }
+            if(li == arrays.length(source.lifecycle) || symbol.size > 8) { throw "nanoc: unsupported lifecycle symbol range" }
+            symbol.section = arrays.at(targetSections,li); symbol.value = arrays.at(targetOffsets,li)
+        }
+        arrays.push(W.symbols,symbol)
+        index = index + 1
+    }
+    index = 0
+    while(index < arrays.length(source.relocations)) {
+        var relocation = copy(source.relocations[index])
+        if(relocation.section >= 4) {
+            var li = 0
+            while(li < arrays.length(source.lifecycle) && (source.lifecycle[li].section != relocation.section || source.lifecycle[li].offset != relocation.offset)) { li = li + 1 }
+            if(li == arrays.length(source.lifecycle) || relocation.kind != 1) { throw "nanoc: lifecycle arrays require 64-bit pointer relocations" }
+            relocation.section = arrays.at(targetSections,li); relocation.offset = arrays.at(targetOffsets,li)
+        }
+        arrays.push(W.relocations,relocation)
+        index = index + 1
+    }
+    return W
+}
 fun nativeWriteObject(view NativeObject O, view string path) {
+    var W = nativeObjectForWrite(O)
+    nativeSerializeObject(W,path)
+}
+fun nativeSerializeObject(view NativeObject O, view string path) {
+
     var array[int] strtab = [0]
     var array[int] symtab = []
     nativeSymbolEntry(symtab,0,0,0,0,0,0)
@@ -569,6 +692,7 @@ fun nativeWriteObject(view NativeObject O, view string path) {
                 symbolIndices[index] = arrays.length(symtab) / 24
                 var binding = 0
                 if(global) { binding = 1 }
+                if(symbol.weak) { binding = 2 }
                 nativeSymbolEntry(symtab,nativeString(strtab,symbol.name),binding,symbol.kind,symbol.section,symbol.value,symbol.size)
             }
             index = index + 1
@@ -577,10 +701,11 @@ fun nativeWriteObject(view NativeObject O, view string path) {
         pass = pass + 1
     }
     var array[NativeSection] sections = []
+    var count = arrays.length(O.sections)
     index = 0
-    while(index < 3) { arrays.push(sections,arrays.at(O.sections,index)); index = index + 1 }
+    while(index < count) { arrays.push(sections,arrays.at(O.sections,index)); index = index + 1 }
     index = 0
-    while(index < 3) {
+    while(index < count) {
         var section = NativeSection(".rela" + arrays.at(O.sections,index).name,0)
         section.kind = 4; section.alignment = 8
         var ri = 0
@@ -611,7 +736,7 @@ fun nativeWriteObject(view NativeObject O, view string path) {
     index = 0
     while(index < arrays.length(sections)) { arrays.push(nameOffsets,nativeString(names.bytes,sections[index].name)); index = index + 1 }
     var array[int] bytes = []
-    nativeHeader(bytes,1,0,0,0,0,11,9)
+    nativeHeader(bytes,1,0,0,0,0,2 * count + 5,2 * count + 3)
     var array[int] offsets = []
     index = 0
     while(index < arrays.length(sections)) {
@@ -628,8 +753,8 @@ fun nativeWriteObject(view NativeObject O, view string path) {
     while(index < arrays.length(sections)) {
         view var section = sections[index]
         var link = 0; var info = 0; var entrySize = 0
-        if(index >= 3 && index <= 5) { link = 7; info = index - 2; entrySize = 24 }
-        if(index == 6) { link = 8; info = firstGlobal; entrySize = 24 }
+        if(index >= count && index < 2 * count) { link = 2 * count + 1; info = index - count + 1; entrySize = 24 }
+        if(index == 2 * count) { link = 2 * count + 2; info = firstGlobal; entrySize = 24 }
         nativeSectionHeader(bytes,arrays.at(nameOffsets,index),section.kind,section.flags,0,arrays.at(offsets,index),arrays.length(section.bytes),link,info,section.alignment,entrySize)
         index = index + 1
     }

@@ -2427,7 +2427,7 @@ fun emitFunction(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C
     F.constNames = copy(C.constNames)
     F.constValues = copy(C.constValues)
     A.line(".text")
-    if (D.internal) { A.line(".local " + D.name) } else { A.line(".globl " + D.name) }
+    if (D.internal) { A.line(".local " + D.name) } else if(D.weak) { A.line(".weak " + D.name) } else { A.line(".globl " + D.name) }
     A.line(".type " + D.name + ", @function")
     A.line(D.name + ":")
     A.line("pushq %rbp")
@@ -2680,7 +2680,7 @@ fun emitGlobal(view mut Asm A, view Decl D, view mut Cursor P, view Compiler C) 
     if (P.isPunct("=")) { P.take(); emitStaticInitializer(A, image, P, C, D.ctype, 0) }
     A.line(".data")
     A.line(".balign " + ("" + tyAlign(C, D.ctype)))
-    if (D.internal) { A.line(".local " + D.name) } else { A.line(".globl " + D.name) }
+    if (D.internal) { A.line(".local " + D.name) } else if(D.weak) { A.line(".weak " + D.name) } else { A.line(".globl " + D.name) }
     A.line(".type " + D.name + ", @object")
     A.line(D.name + ":")
     var index = 0
@@ -2755,10 +2755,13 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
         }
         var external = false
         var internal = false
-        while (P.isWord("static") || P.isWord("extern")) {
-            if (P.isWord("extern")) { external = true }
-            if (P.isWord("static")) { internal = true }
-            P.take()
+        var attributes = Decl("","")
+        while(P.isWord("static") || P.isWord("extern") || P.isWord("__attribute__") || P.isWord("__attribute")) {
+            if(P.isWord("static") || P.isWord("extern")) {
+                if(P.isWord("extern")) { external = true }
+                if(P.isWord("static")) { internal = true }
+                P.take()
+            } else { parseNativeAttributes(P,attributes) }
         }
         if (isCompilerType(P, C) == false) {
             parseFail(P, "expected external declaration")
@@ -2767,13 +2770,30 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
         while (true) {
             var D = parseDeclarator(P, copy(base))
             D.internal = internal
+            parseNativeAttributes(P,D)
+            applyNativeAttributes(D,attributes)
+            var priorIndex = compilerFind(C,D.name)
+            if(priorIndex >= 0) {
+                view var prior = C.globals[priorIndex]
+                D.weak = D.weak || prior.weak
+                if(D.constructor < 0) { D.constructor = prior.constructor }
+                if(D.destructor < 0) { D.destructor = prior.destructor }
+            }
+            if(D.weak && D.internal) { parseFail(P,"weak declaration requires external linkage") }
+            if(D.constructor >= 0 || D.destructor >= 0) {
+                if(D.function == false || functionReturnType(D.ctype) != "void" || arrays.length(D.params) != 0 || D.variadic) { parseFail(P,"constructor/destructor requires a void function with no parameters") }
+            }
+            if(D.weak) { A.line(".weak " + D.name) }
             if (external == false || P.isPunct("=")) { D.ctype = completeArrayType(P, D.ctype) }
             var S = Symbol(copy(D.name), copy(D.ctype), P.peek().line)
             S.function = D.function
             S.params = copy(D.params)
+            S.weak = D.weak; S.constructor = D.constructor; S.destructor = D.destructor
             compilerAdd(C, S)
             if (D.function && P.isPunct("{")) {
                 emitFunction(A, D, P, C)
+                if(D.constructor >= 0) { A.line(".section .init_array." + ("" + D.constructor) + ",\"aw\",@init_array"); A.line(".balign 8"); A.line(".quad " + D.name) }
+                if(D.destructor >= 0) { A.line(".section .fini_array." + ("" + D.destructor) + ",\"aw\",@fini_array"); A.line(".balign 8"); A.line(".quad " + D.name) }
                 break
             }
             if (D.function == false && (external == false || P.isPunct("="))) { emitGlobal(A, D, P, C) }
@@ -2781,6 +2801,17 @@ fun compileTranslationUnit(view mut Compiler C, view array[Token] toks) -> strin
             expectPunct(P, ";")
             break
         }
+    }
+    // Preserve declaration kinds even for symbols defined in another input.
+    var declarationIndex = 0
+    while(declarationIndex < arrays.length(C.globals)) {
+        view var declaration = C.globals[declarationIndex]
+        if(declaration.typedef) { declarationIndex = declarationIndex + 1; continue; }
+        var kind = "@object"
+        if(declaration.function) { kind = "@function" }
+        A.line(".type " + declaration.linkName + ", " + kind)
+        if(declaration.weak) { A.line(".weak " + declaration.linkName) }
+        declarationIndex = declarationIndex + 1
     }
     A.line(".section .note.GNU-stack,\"\",@progbits")
     return A.text()
